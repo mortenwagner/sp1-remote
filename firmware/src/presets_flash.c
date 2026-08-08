@@ -19,6 +19,18 @@
 #include "presets.h"
 
 #define STORAGE_ID   FIXED_PARTITION_ID(storage_partition)
+
+/* The storage partition is 32 KB at 0xF7000. Presets use its FIRST page;
+ * the remaining 28 KB is deliberately left for the runtime-editable
+ * profile (see docs/storage-layout.md), which no longer has to share a
+ * page with anything.
+ *
+ * This is NOT the page at 0xFF000. That one belongs to the bootloader:
+ * it already held 0x5A82B619 on pop before we ever wrote flash, and
+ * feldd's firmware documents it as the bootloader-settings/MBR page,
+ * warning that writing it could brick the bootloader, which is the only
+ * recovery path on hardware with no reset pin. The board devicetree
+ * declares it read-only so nothing can claim it by accident. */
 #define PAGE_LEN     4096
 
 static uint8_t page_buf[PAGE_LEN];
@@ -103,7 +115,7 @@ bool preset_store_save(const preset_bank_t *bank)
 	bool ok = false;
 
 	if (!preset_store_is_safe()) {
-		printk("preset: REFUSING to write. Page 0xFF000 holds data this "
+		printk("preset: REFUSING to write. The storage page holds data this "
 		       "firmware did not write, or a record torn by a reset "
 		       "mid-write. Dump it with PLAY and inspect before "
 		       "trusting it. If it is our own torn record, "
@@ -155,7 +167,7 @@ void preset_store_dump(void)
 			nonff++;
 		}
 	}
-	printk("preset: page 0xFF000, %u of %u bytes are not 0xFF, safe=%d\n",
+	printk("preset: storage page (0xF7000), %u of %u bytes not 0xFF, safe=%d\n",
 	       nonff, PAGE_LEN, preset_store_is_safe() ? 1 : 0);
 
 	if (nonff == 0) {

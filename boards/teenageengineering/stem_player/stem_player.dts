@@ -153,14 +153,40 @@ zephyr_udc0: &usbd {
 			reg = <0x00000000 0x00020000>;
 		};
 
+		/* The app's LINKER CAP ends at 0xDF000, deliberately short of the
+		 * bootloader's actual writable slot (which runs to 0xFEFFF), so the
+		 * image can never grow into the storage region below.
+		 * Layout and reasoning follow bnjreece/feldd-sp1-firmware, an
+		 * independent SP-1 controller firmware that ships this arrangement. */
 		slot0_partition: partition@20000 {
 			label = "image-0";
-			reg = <0x00020000 0x000df000>;
+			reg = <0x00020000 0x000bf000>;
 		};
 
-		storage_partition: partition@ff000 {
+		/* 32 KB at the top of USABLE flash, ending exactly at the reserved
+		 * page. Above the linker-capped app, below 0xFF000. */
+		storage_partition: partition@f7000 {
 			label = "storage";
+			reg = <0x000f7000 0x00008000>;
+		};
+
+		/* 0xFF000..0xFFFFF: the bootloader's own settings / MBR page. DO NOT
+		 * WRITE OR ERASE IT.
+		 *
+		 * Established on pop 2026-08-08: it already holds 0x5A82B619 in its
+		 * first word, written by neither this firmware nor sp1-tape-looper
+		 * (which declares the page but never writes it). feldd's firmware
+		 * documents it as the bootloader-settings/MBR page and warns that
+		 * writing it could brick the bootloader, which is our recovery path
+		 * on hardware with no reset pin. The SP-1-dev wiki independently
+		 * gives the app a max size of 0xDEFFF, i.e. ending just below it.
+		 *
+		 * Declared here only so the address is documented and nothing else
+		 * claims it. */
+		reserved_bootloader_settings: partition@ff000 {
+			label = "bootloader-settings-DO-NOT-TOUCH";
 			reg = <0x000ff000 0x00001000>;
+			read-only;
 		};
 	};
 };
