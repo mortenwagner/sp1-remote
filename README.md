@@ -25,8 +25,10 @@ USB MIDI controller.
 | 6 | LEDs | done, not yet eyeballed |
 | 7 | presets | written, not yet exercised on hardware |
 
-Untested in the whole signal chain: only the bit-banged TRS jack, which
-needs a multimeter and a hand-made adapter. Everything else is measured.
+**The whole signal chain is now proven on hardware**, including TRS MIDI
+out, which needs only an ordinary 3.5 mm cable: data is on the tip (P0.20,
+Type A), so it reaches a Type A input like the Tiliqua's or a USB MIDI
+interface directly.
 
 - Plan: `docs/superpowers/plans/2026-08-08-sp1-remote-implementation.md`
 - Design: `docs/spec.md`

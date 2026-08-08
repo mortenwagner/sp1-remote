@@ -171,7 +171,38 @@ original {0, 42, 85, 127} would have had Off and Boost swapped.
 
 No unexpected CCs in 330 messages.
 
-## Sync jack
+## TRS MIDI PROVEN, 2026-08-08
+
+With the UARTE rewrite (data on the TIP, P0.20, Type A) and an **ordinary
+3.5 mm TRS cable** into a USB MIDI interface. Captured both paths at once
+and compared, TRS against the already-trusted USB sink:
+
+| CC | TRS | USB | |
+|---|---|---|---|
+| 64 freeze | 6 | 6 | identical |
+| 102 cutoff | 230 | 229 | 1 extra at the capture edge |
+| 104 reverb wet | 33 | 33 | identical |
+| 105 shimmer | 2 | 2 | identical |
+| 107 delay time | 29 | 29 | identical |
+| 108 delay feedback | 70 | 70 | identical |
+
+370 vs 369 messages, zero malformed, channel 1 throughout. The single
+difference is the capture loop polling two ports in sequence and closing
+mid-stream, not a transmission fault.
+
+**No adapter was needed.** Everything the earlier plan said about building
+a tip/sleeve-swap adapter, and the whole multimeter investigation in Task
+1.2, was predicated on the looper's claim that MIDI leaves on the RING via
+P0.23. feldd's firmware says the tip at P0.20, validated against an OP-XY,
+and that is what works here. The looper's P0.23 drives Pocket Operator sync
+instead.
+
+Consequences: Task 1.2 (source resistance, drive current, adapter) is moot,
+and so is the `MIDI_INVERT` polarity unknown. A hardware UART also removed
+two Codex findings, flash writes corrupting an in-flight byte and USB
+interrupts jittering bit edges.
+
+## Sync jack (superseded, kept for the record)
 
 Not yet measured; the multimeter work (Task 1.2) is deferred. What is known:
 
