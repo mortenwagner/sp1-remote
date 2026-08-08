@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SP-1 Remote monitor</title>
+<style>
+  :root {
+    --bg:#0e0f12; --panel:#17191f; --line:#262a33; --ink:#e6e8ee;
+    --dim:#8b93a7; --accent:#6ee7b7; --warn:#fbbf24; --bad:#f87171;
+    --track:#1f2430;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --line:#e2e5ea; --ink:#14171c;
+            --dim:#5d6577; --track:#eceff4; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { display:flex; align-items:center; gap:16px; padding:14px 20px;
+           border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.02em; }
+  .sub { color:var(--dim); font-size:12px; }
+  button { font:inherit; padding:7px 14px; border-radius:7px; cursor:pointer;
+           border:1px solid var(--line); background:var(--panel); color:var(--ink); }
+  button:hover { border-color:var(--dim); }
+  button[disabled] { opacity:.4; cursor:default; }
+  #dot { width:9px; height:9px; border-radius:50%; background:var(--bad);
+         display:inline-block; margin-right:7px; }
+  #dot.on { background:var(--accent); }
+  main { padding:20px; display:grid; gap:20px;
+         grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); max-width:1200px; }
+  section { background:var(--panel); border:1px solid var(--line);
+            border-radius:11px; padding:16px; }
+  h2 { font-size:11px; margin:0 0 14px; color:var(--dim); font-weight:600;
+       text-transform:uppercase; letter-spacing:.09em; }
+  .faders { display:flex; gap:18px; align-items:flex-end; height:190px; }
+  .fader { flex:1; display:flex; flex-direction:column; align-items:center; gap:7px; height:100%; }
+  .bar { flex:1; width:100%; background:var(--track); border-radius:6px;
+         position:relative; overflow:hidden; }
+  .fill { position:absolute; left:0; right:0; bottom:0; background:var(--accent);
+          transition:height .05s linear; }
+  .fader .cc { font-size:11px; color:var(--dim); }
+  .fader .val { font-size:15px; font-variant-numeric:tabular-nums; }
+  .row { display:flex; justify-content:space-between; padding:5px 0;
+         border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:0; }
+  .row span:last-child { font-variant-numeric:tabular-nums; }
+  .btns { display:flex; gap:10px; }
+  .btn { flex:1; text-align:center; padding:12px 4px; border-radius:8px;
+         background:var(--track); border:1px solid transparent; font-size:12px; }
+  .btn.act { background:var(--accent); color:#06281d; border-color:var(--accent); }
+  .btn small { display:block; color:var(--dim); font-size:10px; margin-top:3px; }
+  .btn.act small { color:#06281d; opacity:.75; }
+  #log { height:150px; overflow-y:auto; font-size:11px; color:var(--dim);
+         white-space:pre-wrap; }
+  .hint { color:var(--dim); font-size:12px; margin:0; }
+  code { background:var(--track); padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SP-1 Remote</h1>
+  <span class="sub"><span id="dot"></span><span id="state">not connected</span></span>
+  <button id="connect">connect</button>
+  <span class="sub" id="rate"></span>
+</header>
+
+<main>
+  <section>
+    <h2>Faders</h2>
+    <div class="faders" id="faders"></div>
+  </section>
+
+  <section>
+    <h2>Buttons</h2>
+    <div class="btns" id="btns"></div>
+    <p class="hint" style="margin-top:14px">
+      Track&nbsp;1&nbsp;+&nbsp;Track&nbsp;4 held together for 1.2&nbsp;s resets
+      into the bootloader. The raw ladder band is shown below so you can see it
+      coming.
+    </p>
+    <div class="row"><span>ladder raw</span><span id="lad">-</span></div>
+    <div class="row"><span>decoded</span><span id="btn">-</span></div>
+  </section>
+
+  <section>
+    <h2>Power</h2>
+    <div class="row"><span>battery (raw)</span><span id="batt">-</span></div>
+    <div class="row"><span>USB present</span><span id="usb">-</span></div>
+    <div class="row"><span>charging</span><span id="chg">-</span></div>
+  </section>
+
+  <section>
+    <h2>MIDI transmit</h2>
+    <div class="row"><span>pushed to queue</span><span id="push">-</span></div>
+    <div class="row"><span>drained</span><span id="drain">-</span></div>
+    <div class="row"><span>sent to USB</span><span id="usbtx">-</span></div>
+    <div class="row"><span>host listening</span><span id="rdy">-</span></div>
+    <p class="hint" style="margin-top:12px">
+      These three should advance together. If <code>push</code> climbs while
+      <code>drain</code> does not, the transmit thread is stuck; if
+      <code>rdy</code> is 0, no host has opened the MIDI interface and USB
+      sends are dropped.
+    </p>
+  </section>
+
+  <section style="grid-column:1/-1">
+    <h2>Console</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const CC = [102, 104, 107, 108];
+const CCNAME = ['cutoff', 'reverb wet', 'delay time', 'delay fb'];
+const BTNNAME = ['freeze', 'shimmer', 'preset A', 'preset B', 'play'];
+
+const $ = id => document.getElementById(id);
+const fadersEl = $('faders'), btnsEl = $('btns');
+
+for (let i = 0; i < 4; i++) {
+  fadersEl.insertAdjacentHTML('beforeend', `
+    <div class="fader">
+      <div class="val" id="fv${i}">-</div>
+      <div class="bar"><div class="fill" id="ff${i}" style="height:0%"></div></div>
+      <div class="cc">CC ${CC[i]}</div>
+      <div class="cc">${CCNAME[i]}</div>
+    </div>`);
+}
+for (let i = 0; i < 5; i++) {
+  btnsEl.insertAdjacentHTML('beforeend',
+    `<div class="btn" id="b${i}">${i === 4 ? 'PLAY' : 'T' + (i + 1)}<small>${BTNNAME[i]}</small></div>`);
+}
+
+let port, reader, lines = 0, t0 = Date.now();
+
+/* The firmware's diagnostic line, e.g.
+   f0= 123 f1= 456 f2= 789 f3=1012  lad=   5 btn=-1  batt=2393 usb=1 chg=1  push=886 drain=886 usbtx=886 rdy=1 */
+const RE = /f0=\s*(-?\d+) f1=\s*(-?\d+) f2=\s*(-?\d+) f3=\s*(-?\d+)\s+lad=\s*(-?\d+) btn=(-?\d+)(?:\s+batt=\s*(-?\d+) usb=(\d) chg=(\d))?(?:\s+push=(\d+) drain=(\d+) usbtx=(\d+) rdy=(\d))?/;
+
+/* Raw full scale, measured on pop by sweeping all four strips: they reach
+   3734-3742, so 3730 lets every one of them still reach 127. */
+const FULL = 3730;
+
+function paint(m) {
+  for (let i = 0; i < 4; i++) {
+    const raw = +m[i + 1];
+    const cc = raw <= 0 ? 0 : Math.min(127, Math.round(raw * 127 / FULL));
+    $('fv' + i).textContent = cc;
+    $('ff' + i).style.height = (cc / 127 * 100) + '%';
+  }
+  $('lad').textContent = m[5];
+  const b = +m[6];
+  $('btn').textContent = b < 0 ? 'none' : BTNNAME[b];
+  for (let i = 0; i < 5; i++) $('b' + i).classList.toggle('act', b === i);
+
+  if (m[7] !== undefined) {
+    $('batt').textContent = m[7];
+    $('usb').textContent = m[8] === '1' ? 'yes' : 'no';
+    $('chg').textContent = m[9] === '1' ? 'yes' : 'no';
+  }
+  if (m[10] !== undefined) {
+    $('push').textContent = m[10];
+    $('drain').textContent = m[11];
+    $('usbtx').textContent = m[12];
+    $('rdy').textContent = m[13] === '1' ? 'yes' : 'no';
+  }
+}
+
+function log(s) {
+  const el = $('log');
+  el.textContent += s + '\n';
+  if (el.textContent.length > 12000) el.textContent = el.textContent.slice(-9000);
+  el.scrollTop = el.scrollHeight;
+}
+
+$('connect').addEventListener('click', async () => {
+  if (!('serial' in navigator)) {
+    alert('WebSerial needs Chrome or Edge. Safari does not implement it.');
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+  } catch (e) { log('connect failed: ' + e.message); return; }
+
+  $('dot').classList.add('on');
+  $('state').textContent = 'connected';
+  $('connect').disabled = true;
+
+  const dec = new TextDecoderStream();
+  port.readable.pipeTo(dec.writable);
+  reader = dec.readable.getReader();
+
+  let buf = '';
+  for (;;) {
+    let out;
+    try { out = await reader.read(); } catch (e) { log('read error: ' + e.message); break; }
+    if (out.done) break;
+    buf += out.value;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      const m = RE.exec(line);
+      if (m) {
+        paint(m);
+        lines++;
+        const secs = (Date.now() - t0) / 1000;
+        $('rate').textContent = (lines / secs).toFixed(1) + ' lines/s';
+      } else {
+        log(line);          /* anything that is not the diagnostic line */
+      }
+    }
+  }
+  $('dot').classList.remove('on');
+  $('state').textContent = 'disconnected';
+  $('connect').disabled = false;
+});
+</script>
+</body>
+</html>
