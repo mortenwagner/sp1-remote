@@ -4,9 +4,13 @@
 
 **Goal:** Turn one Teenage Engineering SP-1 into a generic 4-fader / 4-button TRS-MIDI controller whose shipped default profile drives the PopGoblin string synth's existing CC map.
 
-**Architecture:** A small Zephyr application for the nRF52840, built against the board definition vendored from `chattock/sp1-tape-looper` (MIT). Hardware-facing code (ADC ladders, LEDs, watchdog, power, bit-banged TRS MIDI TX) is lifted from that firmware, which carries hardware-verified constants. All decision logic (fader conditioning, button state machines, the profile table, preset serialisation) lives in Zephyr-free C files that compile unchanged into a host test binary, so the logic is unit-tested on the Mac and only the electrical behaviour needs the bench.
+**Architecture:** A small Zephyr application for the nRF52840 on a lean base (the `sp1-midi` board template), into which the proven hardware routines from `sp1-tape-looper` are transplanted: the bit-banged TRS MIDI transmitter, the ADC ladder reads, the LED renderer, and the watchdog and power path. All decision logic (fader conditioning, soft pickup, the button state machines, the coalescing transmit queue, the profile table, preset serialisation) lives in Zephyr-free C files that compile unchanged into a host test binary, so the logic is unit-tested on the Mac and only the electrical behaviour needs the bench.
 
 **Tech Stack:** Zephyr RTOS v4.3.1, Zephyr SDK 0.17.4, CMake/Ninja/west, C11, host tests in plain C11 with clang, flashing via the local `solderless.engineering` mirror over WebSerial in Chrome.
+
+**Adversarial review:** this plan was red-teamed by Codex (gpt-5.6-sol, xhigh) against the tiliqua and SP-1 sources on 2026-08-08. It confirmed the three source claims below and returned twelve findings, of which two were device-recovery hazards, four were outright bugs, and one was an uncovered spec requirement. All are folded in; the ones that changed behaviour are called out at the point of change with a "REVIEW" note so the reasoning is not lost.
+
+**Spec version this plan targets:** the 2026-08-08 design as revised the same day after the Codex 5.5 review and 5.6-sol verification (ClaudeLife commit `fd63e0d`). That revision reframed the firmware base, added a takeover policy, replaced per-fader rate limiting with a coalescing transmit queue, and pinned the freeze timing state machine. All four are implemented below.
 
 ---
 
@@ -26,21 +30,21 @@ Consequence: v0 splits into two legs, both cheap.
 
 The sync jack is also the one part of this hardware that the community has **not** published. `timknapen/SP-1-dev` documents the pinout thoroughly, and every pin this plan depends on for faders, LEDs, ladders and the charger matches the looper's map exactly (`src/stemplayer_pins.h:19-84`), which is welcome independent corroboration of the lifted constants. But `P0.23` (the BC807 base), `P0.20` and `P0.17` do not appear in that header at all, and the wiki's "MIDI / PO sync" page is marked *Todo* (`Peripherals.md:26-27`, `_Sidebar.md:16`). The looper's sync-jack constants therefore come from a source that is not in any repo, most likely the SP-1 dev Discord. Treat them as good but unpublished, which is precisely why Task 1.2 measures the jack instead of trusting the comment.
 
-Electrical facts for the adapter: MIDI data leaves on the **ring** of the sync jack, driven by P0.23 (BC807 base) through a PNP that inverts (main.c:4405-4410). The tip carries Pocket-Operator pulses (P0.20 / P0.17). The Tiliqua input is a standard opto-isolated TRS-A stage: `H11L1SR2M` with 220R in series (hardware/schematics/tiliqua-motherboard-r5.1.pdf, sheet `midi`). At 3.3 V through 220R that is roughly 8-9 mA into the opto LED, comfortably inside its rating, so no extra series resistor is needed if the SP-1 sources 3.3 V. The adapter is therefore SP-1 ring to Tiliqua ring, SP-1 sleeve to Tiliqua tip, SP-1 tip unconnected. This is a hypothesis to confirm with a multimeter in Task 1.2, not a fact.
+Electrical facts for the adapter: MIDI data leaves on the **ring** of the sync jack, driven by P0.23 (BC807 base) through a PNP that inverts (main.c:4405-4410). The tip carries Pocket-Operator pulses (P0.20 / P0.17). The Tiliqua input is a standard opto-isolated TRS-A stage: `H11L1SR2M` with 220R in series (hardware/schematics/tiliqua-motherboard-r5.1.pdf, sheet `midi`). At 3.3 V through 220R that is roughly 8 to 9 mA into the opto LED, comfortably inside its rating, so no extra series resistor is needed *if* the SP-1 sources 3.3 V through a low impedance. The adapter is therefore SP-1 ring to Tiliqua ring, SP-1 sleeve to Tiliqua tip, SP-1 tip unconnected. This is a hypothesis to confirm with a multimeter in Task 1.2, not a fact.
 
 **3. The synth is omni, and CC 64 is level-based, not a toggle.**
-`gateware/src/top/popgoblin/fw/src/main.rs:115-124` parses `MidiMessage::ControlChange(_, cc, val)` and discards the channel, so any channel works (pre-flight #4 answered from source). CC 64 sets `cc64_held = v >= 64`, i.e. the synth holds freeze for as long as the last value it saw was 64 or more. The spec's "tap = latch, hold = momentary" is therefore implemented entirely puck-side, which is what Phase 5 does.
+`gateware/src/top/popgoblin/fw/src/main.rs:115-124` parses `MidiMessage::ControlChange(_, cc, val)` and discards the channel, so any channel works (pre-flight #4 answered from source). CC 64 sets `cc64_held = v >= 64`, i.e. the synth holds freeze for as long as the last value it saw was 64 or more. The spec's freeze timing state machine is therefore implemented entirely puck-side, which is what Phase 5 does.
 
-**Firmware base: the spec's option A, executed as a lift rather than a fork.**
-The spec left the choice open until pre-flight (A: fork `sp1-tape-looper`; B: build on the `sp1-midi` Zephyr template). Having read both, the plan takes A's code and B's shape: a new, small application that vendors the looper's board definition and lifts its hardware-facing routines, each with an attribution comment naming the source line range.
+**Firmware base: the spec's reframed option A, "lean base plus transplant".**
+The revised spec settles this: start from the `sp1-midi` template and marisko board definition, and transplant the proven pieces from `sp1-tape-looper` (MIDI TX on TRS, fader read, LEDs, power and charging), because "strip the looper" risks becoming the project. Having read both, that is the right call and this plan follows it. Supporting evidence: `firmware/src/main.c` is 7614 lines of which roughly nine tenths is the looper engine, the eMMC driver and the I2S audio path, all interlocked through shared volatile globals. `sp1-midi` by contrast is a purpose-built BSP ("Fork this repo to build new firmware... MIDI controllers") with a watchdog, reset breadcrumbs, a charger driver and a fader-to-CC controller already in it (`app/MidiController.hpp:14-26`).
 
-Why not a straight fork: `firmware/src/main.c` is 7614 lines, and roughly nine tenths of it is the looper engine, the eMMC driver and the I2S audio path, all interlocked through shared volatile globals. Deleting that safely is harder and riskier than lifting the 600 or so lines that matter.
+Two things the transplant must carry across, because `sp1-midi` cannot supply them:
+- Its `MidiController` sends over **USB MIDI 2** (`usbd_midi2.h`), not the TRS jack. The bit-banged TRS transmitter exists only in the looper.
+- Its board files declare PWM LED nodes. The looper's board file deliberately drops them, because PWM owning those pins fights the direct GPIO writes its soft-PWM renderer needs (`boards/.../stem_player.dts:15-17`). Apply the same two deltas, and cite that comment as the reason.
 
-Why not B: `sp1-midi` is a genuinely nice BSP and its `MidiController` already does fader-to-CC (`app/MidiController.hpp:14-26`, four faders, a deadband of 8), but it sends over **USB MIDI 2** (`usbd_midi2.h`), not over the TRS jack. The one thing this project cannot get anywhere else is the looper's bit-banged TRS transmitter. Its board files also declare PWM LED nodes that would fight direct GPIO writes, which is exactly why the looper's own board file drops them. Keep `sp1-midi` checked out as a structural reference.
+Fallback if the transplant stalls at board bring-up: a direct looper fork with the engine deleted (the spec's option B). Decide that at Task 2.1, on evidence, not in advance.
 
-If the lift stalls, the fallback is a straight fork of the looper with the engine deleted. Decide that at Task 2.1, on evidence, not in advance.
-
-**One scope correction:** the spec says "fader LED trails mirror the last-sent value". The known pin map has eight discrete LEDs, not per-fader trails: four centre-row LEDs (main.c:101-104) and four track LEDs above the buttons (main.c:107-110). There is no evidence of an addressable trail. Phase 6 therefore renders fader value as *brightness* on the centre-row LED via the existing soft-PWM renderer, and uses the track LEDs for button state. Task 2.3 includes a short LED survey to confirm there is nothing else on the panel; if a trail turns up, Phase 6 grows a task.
+**One scope correction:** the spec says "fader LED trails mirror the last-sent value". The known pin map has eight discrete LEDs, not per-fader trails: four centre-row LEDs (main.c:101-104) and four track LEDs above the buttons (main.c:107-110). There is no evidence of an addressable trail. Phase 6 therefore renders fader value as *brightness* on the centre-row LED via the soft-PWM renderer, and uses the track LEDs for button state. Task 2.3 includes a short LED survey to confirm there is nothing else on the panel; if a trail turns up, Phase 6 grows a task.
 
 ---
 
@@ -49,14 +53,20 @@ If the lift stalls, the fallback is a straight fork of the looper with the engin
 - **Develop on ONE puck only.** The other pucks stay stock until v1 is proven. Mark the dev puck physically before Phase 1.
 - **The SP-1 "BIG FIVE" bootloader rules are non-negotiable** (source: `sp1-tape-looper/firmware/src/main.c:40-44`). The app lives at `0x20000`; the watchdog is fed at least every 5 s; bootloader-owned clocks and peripherals are not re-initialised; `SYSTEM_OFF` is the only power-down path; `RESETREAS` is cleared at boot and again before `SYSTEM_OFF`. There is no hardware reset pin on the SP-1. A firmware that hangs without feeding the watchdog, or that cannot get back to the bootloader, is a brick.
 - **Bootloader entry:** power off, hold Track 1 + Track 4, plug in USB-C, release once the Track 1 LED lights.
+- **The firmware must carry its own escape hatch.** REVIEW: the looper does not rely on the power-off path alone. It implements `enter_dfu()` (`main.c:5743-5752`): holding Track 1 + Track 4 for 1.2 s *while the app is running* writes `GPREGRET = 0x57` and calls `NVIC_SystemReset()`, so the bootloader's own button scan catches the still-held combo and enters DFU. It is triggered from the control loop at `main.c:6981`. This is the difference between "recoverable" and "recoverable only while the app is healthy", and Task 2.1 transplants it. A power-off drill on a healthy app does not test recovery from a wedged one.
+- **Transmit spacing is set by the receiver, not by us.** REVIEW: popgoblin's MIDI FIFO is 8 entries deep (`top.py:150`) and its firmware drains exactly one entry per 5 ms timer ISR (`main.rs:28,100`), so the synth absorbs at most 200 messages per second. The drain thread therefore paces messages at 5 ms, which is also why coalescing matters: it is the queue, not the wire, that must absorb a fast sweep.
 - **Flash image format:** raw `.bin`, written to `0x20000`, maximum size `0xDF000` (`solderless/utility/js/protocol.js:8-13`). The flasher never touches `0xFF000` and above, so the 4 KB storage partition survives a reflash. Preset data must live there and nowhere else.
 - **Only one 4 KB page of storage exists** (`0xFF000` to `0x100000`). Zephyr NVS needs two sectors, so it is not usable. Presets use an append-log inside the single page (Phase 7).
+- **Do not erase that page until its ownership is proved.** REVIEW: both reference board files *label* `0xFF000` as `storage`, but a label is not evidence that the TE bootloader does not keep settings or recovery metadata there. Erasing it on a hunch is a plausible soft-brick. Task 7.0 dumps and inspects the page before anything writes to it, and the append-log is designed so that the erase only happens after 102 saves, by which point the page is demonstrably ours.
 - **No changes to the synth.** Not gateware, not firmware. The popgoblin CC map is the entire contract.
-- **Fader full-scale raw code is 3700** on the 12-bit SAADC as configured (gain 1/6, 0.6 V internal reference, 20 us acquisition). Source: `main.c:7487`.
-- **CC emission:** 7-bit, send-on-change only, at most one message per 10 ms per fader. Multi-message bursts are spaced 1 to 2 ms.
+- **Fader full-scale raw code is 3700** on the 12-bit SAADC as configured (gain 1/6, 0.6 V internal reference, 20 us acquisition). Source: `main.c:7487`. Confirm on this unit in Task 2.2 and size the deadband from measured jitter, per the spec's revised risk note.
+- **Transmit path:** send-on-change with a per-fader deadband, and **every** message goes through ONE coalescing transmit queue where the latest value for a given (channel, CC) wins. No per-fader millisecond rate limit: four faders naively limited to one message per 10 ms each would occupy about 38 percent of the 31250 baud wire, and coalescing keeps worst-case latency flat when all four move together. The control loop must never block on transmission.
+- **The puck is silent at power-on.** It has no readback: MIDI here is one-way. The first ADC reading of each fader only seeds state. Nothing is transmitted until a control is actually moved or pressed.
+- **Takeover policy:** during a performance the puck is the authoritative controller for its four CCs. After a preset recall (the one case where the puck's own faders desync from what it just sent), each affected fader enters soft pickup: its output is suppressed until its physical position crosses the recalled value, then it takes over. Cross-to-catch, not touch-to-jump.
+- **Freeze timing (CC 64, sustain semantics, at least 64 is on):** press always sends 127. Release before 400 ms leaves it latched and sends nothing. Release after 400 ms sends 0, because that press was a momentary pedal. A press while latched sends 0 and unlatches.
 - **Default MIDI channel is 1** (wire value 0). Per-control channel is configurable in the profile table.
-- **Zephyr v4.3.1 with SDK 0.17.4.** Pinned; the vendored board files were written against this line.
-- **Licence:** MIT, matching the upstream code being lifted. Every lifted block keeps an attribution comment naming the source file and line range.
+- **Zephyr v4.3.1 with SDK 0.17.4.** Pinned.
+- **Licence:** MIT, matching the upstream code being transplanted. Every transplanted block keeps an attribution comment naming the source file and line range.
 - **No em-dashes in prose written into this repo** (README, docs, commit messages). Use colons, commas, parentheses.
 
 ---
@@ -73,10 +83,11 @@ sp1-remote/
     superpowers/plans/            this plan
     hardware-notes.md             bench-verified electrical facts (grows in Phase 1)
     flashing.md                   flash + recovery drill, written from real steps
+    toolchain.md                  the exact commands that built it
   refs/
     fetch.sh                      clones the reference repos (gitignored contents)
   boards/teenageengineering/stem_player/
-                                  vendored verbatim from sp1-tape-looper (MIT)
+                                  from sp1-midi, with the looper's two deltas
   firmware/
     CMakeLists.txt
     prj.conf
@@ -84,9 +95,10 @@ sp1-remote/
     src/
       main.c                      init + the control loop, nothing else
       board_io.c / board_io.h     ADC ladders, button decode, LEDs, WDT, power
-      midi_tx.c  / midi_tx.h      bit-banged TRS MIDI TX (lifted)
-      profile.c  / profile.h      the config table + the shipped default profile
-      controls.c / controls.h     PURE: fader conditioning, button FSM
+      midi_tx.c  / midi_tx.h      bit-banged TRS MIDI TX + the drain thread
+      txqueue.c  / txqueue.h      PURE: the coalescing transmit queue
+      profile.c  / profile.h      PURE: the config table + shipped default
+      controls.c / controls.h     PURE: fader conditioning, pickup, button FSM
       buttons.c  / buttons.h      PURE: the unified button behaviour model
       presets.c  / presets.h      PURE: preset record encode/decode/page scan
       presets_flash.c             Zephyr flash IO for the storage page
@@ -94,12 +106,15 @@ sp1-remote/
     Makefile                      builds and runs every pure-logic test with clang
     test_util.h                   tiny assert runner
     test_controls.c
+    test_txqueue.c
     test_buttons.c
     test_presets.c
     test_profile.c
 ```
 
-`controls.c`, `buttons.c`, `presets.c` and `profile.c` must not include any Zephyr header. That is what makes the host tests possible, and it is the single most important structural rule in this plan.
+`controls.c`, `buttons.c`, `presets.c`, `profile.c` and `txqueue.c` must not include any Zephyr header. That is what makes the host tests possible, and it is the single most important structural rule in this plan.
+
+**Every pure-logic implementation and every test in this plan was compiled and run before the plan was committed**, with `clang -std=c11 -Wall -Wextra -Werror`: 46 tests across five suites, all passing, including the regression tests for the bugs the adversarial review found. A failure when you run them means a transcription slip, not a design problem.
 
 ---
 
@@ -117,7 +132,7 @@ Nothing here touches hardware. It exists before the bench session on purpose: th
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `refs/fetch.sh` placing `refs/sp1-tape-looper` and `refs/sp1-midi` on disk. Every later task that says "lift from main.c:NNNN" reads from `refs/sp1-tape-looper/firmware/src/main.c`.
+- Produces: `refs/fetch.sh` placing `refs/sp1-tape-looper`, `refs/sp1-midi` and `refs/SP-1-dev` on disk. Every later task that says "transplant from main.c:NNNN" reads from `refs/sp1-tape-looper/firmware/src/main.c`.
 
 - [ ] **Step 1: Write `LICENSE`**
 
@@ -127,8 +142,8 @@ MIT, copyright "2026 Morten Wagner". Add a second paragraph below the licence te
 Portions of firmware/src (board bring-up, ADC ladder reads, LED soft-PWM,
 watchdog and power handling, and the bit-banged TRS MIDI transmitter) are
 derived from chattock/sp1-tape-looper, MIT licensed, and from work by
-timknapen (SP-1-dev pin map) and ericlewis (sp1-midi board reference).
-The board definition under boards/ is vendored from sp1-tape-looper.
+timknapen (SP-1-dev pin map) and ericlewis (sp1-midi board definition and
+BSP, on which the board files here are based).
 ```
 
 - [ ] **Step 2: Write `.gitignore`**
@@ -148,7 +163,8 @@ tests/host/build/
 ```bash
 #!/usr/bin/env bash
 # Clone the SP-1 reference firmwares next to this script. Contents are
-# gitignored: they are read-only references for lifted code and line numbers.
+# gitignored: they are read-only references for transplanted code and the
+# line numbers this plan cites.
 set -euo pipefail
 cd "$(dirname "$0")"
 clone() {
@@ -158,8 +174,11 @@ clone() {
 clone https://github.com/chattock/sp1-tape-looper.git sp1-tape-looper
 clone https://github.com/ericlewis/sp1-midi.git       sp1-midi
 clone https://github.com/timknapen/SP-1-dev.git       SP-1-dev
+clone https://github.com/timknapen/SP-1-dev.wiki.git  SP-1-dev-wiki
 echo "references ready in $(pwd)"
 ```
+
+The wiki is a separate repo from the code and holds the hardware pages. Note while you are there that its MIDI / PO sync page is a Todo: the sync jack is undocumented, which Task 1.2 exists to fix.
 
 - [ ] **Step 4: Write `README.md`**
 
@@ -184,12 +203,14 @@ git commit -m "chore: repository skeleton, licence, reference fetch script"
 
 ### Task 0.2: Zephyr toolchain, proven by building the looper unmodified
 
+Building the looper is the toolchain proof *and* produces the v0 image Phase 1 flashes. It is not the base we develop on.
+
 **Files:**
 - Create: `docs/toolchain.md`
 
 **Interfaces:**
 - Consumes: `refs/sp1-tape-looper`.
-- Produces: a working `west` in `~/zephyrproject`, and `refs/sp1-tape-looper/build/zephyr/zephyr.bin`, which is the image Phase 1 flashes.
+- Produces: a working `west` in `~/zephyrproject`, and `refs/sp1-tape-looper/build/zephyr/zephyr.bin`.
 
 - [ ] **Step 1: Install host dependencies**
 
@@ -197,7 +218,7 @@ git commit -m "chore: repository skeleton, licence, reference fetch script"
 brew install cmake ninja gperf python3 ccache dtc libmagic wget
 cmake --version && ninja --version && dtc --version
 ```
-Expected: CMake 3.20 or newer.
+Expected: CMake 3.20 or newer. None of these are currently installed on this Mac, so expect a real install, not a no-op.
 
 - [ ] **Step 2: Create the west workspace on Zephyr v4.3.1**
 
@@ -335,9 +356,12 @@ BUILD   := build
 
 SRC_smoke    :=
 SRC_controls := ../../firmware/src/controls.c
-SRC_buttons  := ../../firmware/src/buttons.c ../../firmware/src/controls.c
-SRC_presets  := ../../firmware/src/presets.c
+SRC_txqueue  := ../../firmware/src/txqueue.c ../../firmware/src/profile.c
 SRC_profile  := ../../firmware/src/profile.c
+SRC_buttons  := ../../firmware/src/buttons.c ../../firmware/src/controls.c \
+                ../../firmware/src/profile.c
+SRC_presets  := ../../firmware/src/presets.c ../../firmware/src/buttons.c \
+                ../../firmware/src/controls.c ../../firmware/src/profile.c
 
 TESTS := smoke
 
@@ -395,7 +419,7 @@ Physically label one puck (tape, marker, anything). Record any serial or disting
 cd "/Users/morten/Documents/Other Creations/dev/solderless/solderless-2026-05-18"
 python3 -m http.server 8788
 ```
-Open `http://127.0.0.1:8788/` in Chrome (WebSerial does not exist in Safari).
+Open `http://127.0.0.1:8788/` in Chrome (WebSerial does not exist in Safari). This is a local mirror of solderless.engineering scraped 2026-05-18, so it works without network.
 
 - [ ] **Step 3: Enter bootloader mode and confirm the device appears**
 
@@ -426,6 +450,8 @@ git commit -m "docs: flash and recovery drill executed on the dev puck"
 
 ### Task 1.2: Sync jack electrical survey and adapter
 
+The spec's revised pre-flight #1 asks for four things specifically: pin order, idle polarity, source resistance and drive current, because the Tiliqua input is a current loop and not a logic-level UART line. This task answers all four.
+
 **Files:**
 - Create: `docs/hardware-notes.md`
 
@@ -436,33 +462,50 @@ git commit -m "docs: flash and recovery drill executed on the dev puck"
 
 The SP-1 has two 3.5 mm jacks. With the looper running and nothing playing, identify the sync jack (the non-audio one). Note how you told them apart.
 
-- [ ] **Step 2: Measure the idle state**
+- [ ] **Step 2: Measure pin order and idle polarity**
 
 With a multimeter, referenced to USB-C shell ground: measure sleeve (expect continuity to ground, near 0 ohm), ring (expect a steady DC level, hypothesis 3.3 V, this is MIDI idle/mark), and tip (expect near 0 V while stopped, this is the PO sync line). Record the actual numbers.
 
-Interpretation: a steady high on the ring at idle confirms the PNP stage described at `main.c:4405-4410` and that `MIDI_INVERT 1` is correct. A steady low at idle means the polarity is inverted, and Phase 3 will need `MIDI_INVERT 0`. Either way, record it.
+Interpretation: a steady high on the ring at idle confirms the PNP stage described at `main.c:4405-4410` and that `MIDI_INVERT 1` is correct. A steady low at idle means the polarity is inverted, and Phase 3 will need `MIDI_INVERT 0`.
 
-- [ ] **Step 3: Watch the ring while the looper transmits**
+- [ ] **Step 3: Measure source resistance and available drive current**
 
-Start the looper's transport so it emits clock. On a scope, or by watching the DC average fall on the meter, confirm the ring is being modulated. If the ring never moves, the MIDI TX is either compiled out or on a different pin, and Task 1.3 will fail; note it now.
+This is the step that decides whether the adapter is safe and whether it will work at all.
 
-- [ ] **Step 4: Build the adapter**
+Measure the open-circuit ring voltage (from Step 2), then load the ring to ground through a known resistor of about 220 ohm (matching what the Tiliqua presents) and measure the voltage again. Source resistance is `R_load * (V_open - V_loaded) / V_loaded`, and the loop current is `V_loaded / R_load`.
 
-Working hypothesis, to be tested in Task 1.3: **SP-1 ring to Tiliqua ring, SP-1 sleeve to Tiliqua tip, SP-1 tip unconnected.** Rationale: the Tiliqua input is an opto (`H11L1SR2M`) with 220R in series across the tip and ring of a TRS-A jack, so it needs a current loop, not a logic level. The SP-1 supplies the source on its ring and ground on its sleeve.
+Interpret against the receiver: the Tiliqua's `H11L1SR2M` needs roughly 5 mA through its LED to switch reliably.
+- 5 mA or more with a source resistance of a few tens of ohms: connect directly, no extra parts.
+- Noticeably under 5 mA: the SP-1's own series resistance is doing too much. Do not simply connect and hope; note it and expect marginal or missing bytes in Task 1.3, then consider a buffer.
+- Much more than 20 mA: unlikely given the 220R at the receiver, but if the open-circuit voltage turns out to be a battery rail rather than 3.3 V, recompute before connecting.
 
-Build it from two 3.5 mm TRS pigtails joined with the mapping above (or a breakout board plus jumpers). No series resistor: at 3.3 V through the receiver's 220R the LED sees roughly 8 to 9 mA, which is correct for MIDI and well inside the part's rating.
+Record all three numbers. This is the measurement that protects the Tiliqua.
 
-- [ ] **Step 5: Ask the Discord if the schematic exists**
+REVIEW, and this changes the recommendation: the MIDI electrical specification requires current limiting on the **transmitter** side, not only at the receiver. The Tiliqua's D1 protection diode plus its 220R means a wrong polarity yields silence rather than a damaged opto, so the receiver is not the part at risk. The part at risk is the scarce SP-1: if its ring is driven from a rail with little series resistance, a ring-to-sleeve short (which happens routinely while a TRS plug slides through its intermediate contacts on insertion) puts that short straight across the output stage.
+
+So unless Step 3 measures a source resistance that already provides limiting, **put a resistor in the adapter on the SP-1 ring**. Size it from the measurement: enough total series resistance that a dead short is bounded to a safe current, while still delivering at least 5 mA through the receiver's LED. At 3.3 V with the receiver's 220R and roughly 1.2 V of LED drop, about 100R extra still yields around 6.5 mA. Prefer a working link with a resistor over a marginally brighter one without.
+
+- [ ] **Step 4: Watch the ring while the looper transmits**
+
+Start the looper's transport so it emits clock. Confirm on a **scope** that the ring is being modulated. REVIEW: a multimeter is not dependable here. MIDI clock is sparse (24 bytes per beat, each 320 us), so the shift in DC average is tiny and easily lost in meter averaging. If no scope is available, skip to Task 1.3 and let the byte-level monitor be the test: absence of movement on a meter proves nothing. If the ring never moves, the MIDI TX is either compiled out or on a different pin, and Task 1.3 will fail; note it now.
+
+- [ ] **Step 5: Build the adapter**
+
+Working hypothesis, to be tested in Task 1.3: **SP-1 ring to Tiliqua ring, SP-1 sleeve to Tiliqua tip, SP-1 tip unconnected.** Rationale: the Tiliqua input is an opto with 220R in series across the tip and ring of a TRS-A jack, so it needs a current loop. The SP-1 supplies the source on its ring and ground on its sleeve. Leaving the SP-1 tip disconnected also keeps the PO sync pulses out of the loop.
+
+Build it from two 3.5 mm TRS pigtails joined with the mapping above (or a breakout board plus jumpers), using the current figure from Step 3 to decide whether any series resistance is needed.
+
+- [ ] **Step 6: Ask the Discord if the schematic exists**
 
 The sync jack is the only part of this hardware with no published documentation: it is absent from `SP-1-dev/src/stemplayer_pins.h` and its wiki page is a Todo. The looper's constants came from somewhere, and the TE SP-1 DEV Discord (linked from the SP-1-dev README) is the likely home of TimK's sync-jack schematic. One question there could replace an afternoon of probing. Ask, then continue regardless: measurement does not depend on an answer.
 
-- [ ] **Step 6: Write `docs/hardware-notes.md`**
+- [ ] **Step 7: Write `docs/hardware-notes.md`**
 
-The jack identification, every measured voltage, the adapter wiring diagram in ASCII, and the reasoning above. Note explicitly which facts are measured and which are inherited from the looper's comments, since this is the one area where the community documentation runs out. This file is the one place hardware facts live; later phases cite it instead of re-measuring.
+The jack identification, every measured voltage and current, the derived source resistance, the adapter wiring diagram in ASCII, and the reasoning above. Note explicitly which facts are measured and which are inherited from the looper's comments, since this is the one area where the community documentation runs out.
 
 If the schematic does turn up, add it here and say so: it would also be the single most useful thing this project could contribute back to SP-1-dev.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add docs/hardware-notes.md
@@ -493,10 +536,10 @@ Expected: a steady stream of clock messages at 24 per quarter note, plus start o
 
 - [ ] **Step 3: If nothing arrives, work the decision tree in order**
 
-1. Ring not modulating at all (from Task 1.2 Step 3): the TX is not running. Check `MIDI_SYNC_ENABLE` is 1 in the build (`main.c:4436`) and that the looper transport is actually running, since clock only flows when the engine or a tapped grid is active.
+1. Ring not modulating at all (from Task 1.2 Step 4): the TX is not running. Check `MIDI_SYNC_ENABLE` is 1 in the build (`main.c:4436`) and that the looper transport is actually running, since clock only flows when the engine or a tapped grid is active.
 2. Bytes arrive but are garbage: polarity. Rebuild the looper with `MIDI_INVERT 0` (`main.c:4422`), reflash, retest. This is why Phase 0 came first.
 3. Bytes arrive but the rate is wrong: baud. `MIDI_BIT_US` is 32 for 31250 (`main.c:4423`).
-4. Nothing at all and the ring does modulate: the adapter mapping is wrong. Try SP-1 ring to Tiliqua tip with sleeve to ring. If that also fails, the loop has no return path and the adapter needs a bench supply, which is a finding worth stopping on.
+4. Nothing at all and the ring does modulate: the adapter mapping is wrong. Try SP-1 ring to Tiliqua tip with sleeve to ring. If that also fails, and Task 1.2 Step 3 measured under 5 mA, the loop is current-starved rather than miswired, which is a finding worth stopping on.
 
 - [ ] **Step 4: Record the result**
 
@@ -538,12 +581,12 @@ git commit -m "docs: v0b, MIDI clock confirmed arriving at the Tiliqua"
 
 # Phase 2: Firmware skeleton
 
-First custom code. The deliverable is a firmware that boots, shows life, powers down cleanly, and can be recovered. No MIDI yet: nothing is worth debugging on top of an uncertain bring-up.
+First custom code. The deliverable is a firmware that boots, shows life, charges, powers down cleanly, and can be recovered. No MIDI yet: nothing is worth debugging on top of an uncertain bring-up.
 
 ### Task 2.1: Buildable skeleton with watchdog and clean power-off
 
 **Files:**
-- Create: `boards/teenageengineering/stem_player/` (vendored, 6 files)
+- Create: `boards/teenageengineering/stem_player/` (from `sp1-midi`, with two deltas)
 - Create: `firmware/CMakeLists.txt`
 - Create: `firmware/prj.conf`
 - Create: `firmware/app.overlay`
@@ -558,25 +601,34 @@ First custom code. The deliverable is a firmware that boots, shows life, powers 
   - `void board_io_feed_wdt(void);`
   - `bool board_io_function_held(void);`
   - `void board_io_power_off(void);` (never returns)
-  - `int  board_io_read_fader(int idx);` (0 to 4095 raw, negative on ADC error)
+  - `int  board_io_read_fader(int idx);` (raw SAADC code, negative on error)
   - `int  board_io_read_track_ladder(void);` (raw code, negative on error)
+  - `int  board_io_decode_track_button(int raw);` (-1 none, 0 to 3 tracks, 4 play)
   - `void board_io_led_set(int idx, uint8_t level);` (centre row, level 0 to 255)
   - `void board_io_track_led_set(int idx, bool on);`
 
-- [ ] **Step 1: Vendor the board definition**
+- [ ] **Step 1: Take the board definition from sp1-midi, then apply the looper's two deltas**
 
 ```bash
 mkdir -p boards/teenageengineering
-cp -R refs/sp1-tape-looper/boards/teenageengineering/stem_player boards/teenageengineering/
+cp -R refs/sp1-midi/boards/teenageengineering/stem_player boards/teenageengineering/
 ls boards/teenageengineering/stem_player
 ```
-Expected six files: `board.cmake`, `board.yml`, `Kconfig.defconfig`, `Kconfig.stem_player`, `stem_player-pinctrl.dtsi`, `stem_player.dts`, `stem_player_defconfig`.
 
-Then edit `stem_player.dts`: delete the whole `uac2_speaker` node and the `#include <dt-bindings/usb/audio.h>` line, since this firmware has no USB audio. Leave `cdc_acm_uart0` and the `chosen zephyr,console` alone: the serial console is the debug lifeline. Add a comment at the top of the file naming the source repo and licence.
+Then edit, and put a comment at the top of `stem_player.dts` naming the source repo, the licence, and these two deliberate differences:
+
+1. **Remove the PWM LED nodes.** The looper's board file documents why (`refs/sp1-tape-looper/boards/.../stem_player.dts:15-17`): the LEDs are driven as raw GPIO by a soft-PWM renderer, and a PWM peripheral owning those pins fights it. We transplant that renderer, so we inherit the constraint.
+2. **Disable `uart0`.** P1.01 to P1.04 belong to the CYBT Bluetooth module. This firmware never touches it, and driving TX risks contention.
+
+Keep `cdc_acm_uart0` and `chosen zephyr,console`: the serial console is the debug lifeline. REVIEW: with `CONFIG_USB_DEVICE_STACK_NEXT=y` and `CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT=n`, the console does **not** come up by itself. The application must bring USB up, exactly as the looper does (`main.c:4864`, using the helper pulled in by `include(${ZEPHYR_BASE}/samples/subsys/usb/common/common.cmake)` at `firmware/CMakeLists.txt:4`). Add that `include(...)` to our CMakeLists and call `sample_usbd_init_device()` then `usbd_enable()` from `board_io_init`, or Task 2.2's console will never enumerate and the whole characterisation step is unobservable. Remove any USB audio node if `sp1-midi`'s board declares one; this firmware has no audio path.
+
+Cross-check the fader, LED, ladder and charger pins against `refs/SP-1-dev/src/stemplayer_pins.h:19-84`. All of them are published there and should match exactly. Any mismatch is a real finding: stop and resolve it before flashing.
+
+**Decision gate:** if the board comes up cleanly through Step 9, continue on this base. If bring-up is flaky in ways that trace to the board definition rather than your own code, fall back to the spec's option B (fork the looper, delete the engine) and record why in `docs/hardware-notes.md`.
 
 - [ ] **Step 2: Write `firmware/app.overlay`**
 
-Copy the ADC channel block from `refs/sp1-tape-looper/firmware/app.overlay` verbatim (channels 2 to 6, the four faders plus battery) and the `zephyr_user` `io-channels` list. Keep the comment explaining that channels 0 and 1 (the button ladders) come from the board file. Do not change gain, reference or acquisition time: the decode thresholds in Task 2.2 are calibrated to exactly this configuration.
+Copy the ADC channel block from `refs/sp1-tape-looper/firmware/app.overlay` verbatim (channels 2 to 6, the four faders plus battery) and the `zephyr_user` `io-channels` list, adjusting for whatever `sp1-midi`'s board file already declares so that channels are not defined twice. Do not change gain, reference or acquisition time: the button decode thresholds in Step 6 are calibrated to exactly this configuration.
 
 - [ ] **Step 3: Write `firmware/prj.conf`**
 
@@ -639,13 +691,14 @@ target_sources(app PRIVATE
   src/controls.c
   src/buttons.c
   src/profile.c
+  src/txqueue.c
   src/presets.c
   src/presets_flash.c
   src/midi_tx.c
 )
 ```
 
-Create empty stubs for the files that later phases fill in, so the build is green from here: each stub is the header include plus nothing. Add them as they are introduced if you prefer, but keep this list as the target.
+Create empty stubs for the files later phases fill in, each just its header include, so the build stays green from here.
 
 - [ ] **Step 5: Write `firmware/src/board_io.h`**
 
@@ -668,6 +721,7 @@ void board_io_feed_wdt(void);
  * should hold its last value. */
 int  board_io_read_fader(int idx);
 int  board_io_read_track_ladder(void);
+int  board_io_decode_track_button(int raw);
 
 bool board_io_function_held(void);
 void board_io_power_off(void);
@@ -678,28 +732,50 @@ void board_io_track_led_set(int idx, bool on);
 #endif /* SP1_BOARD_IO_H */
 ```
 
-- [ ] **Step 6: Write `firmware/src/board_io.c` by lifting from the looper**
+- [ ] **Step 6: Write `firmware/src/board_io.c` by transplanting from the looper**
 
-Lift these blocks from `refs/sp1-tape-looper/firmware/src/main.c`, keeping an attribution comment with the line range on each:
+Transplant these blocks from `refs/sp1-tape-looper/firmware/src/main.c`, keeping an attribution comment with the line range on each. Prefer `sp1-midi`'s equivalents where it has one that is already a clean driver (its charger and watchdog subsystems in particular); take the looper's version where the constants are the value.
 
 | What | Source lines | Notes |
 |---|---|---|
-| `struct led`, `leds[]`, `track_leds[]` | 100-110 | pin maps, verified on hardware |
+| `struct led`, `leds[]`, `track_leds[]` | 100-110 | pin maps, cross-checked against SP-1-dev |
 | power/function button pins | 121-123 | P0.27, active low with pull-up |
-| BQ24232 charger pins | 126-129 | needed by power-off |
+| BQ24232 charger pins | 126-129 | needed by power-off and by charging |
 | `BTN_COM` rail | 145-146 | P1.10 must be high before sampling |
 | `adc_ladder[]` and the `LAD_*` indices | 143-156 | keep the index meanings identical |
 | `ladder_read()` | 192-208 | 2x oversample, returns -1 on error |
 | `controls_init()` | 211 onward | raise `BTN_COM`, set up ADC channels |
-| LED soft-PWM (`led_pwm_init`, ISR, `led_on`, `led_off`, `track_led_on`, `track_led_off`, `all off`) | 5121-5320 | keep the zero-latency IRQ |
-| `feed_wdt()` and watchdog install | 5524-5583 | 4 s window |
+| `decode_tracks()` | 5098-5107 | the calibrated thresholds, below |
+| LED soft-PWM (`led_pwm_init`, ISR, `led_on`, `led_off`, `track_led_on`, `track_led_off`, all-off) | 5121-5320 | keep the zero-latency IRQ |
+| `feed_wdt()` | 5565-5583 | feeds the timeout installed below |
+| watchdog install (`wdt_install_timeout` + `wdt_setup`) | 5901-5906 | 4 s window. REVIEW: this is NOT inside the `feed_wdt` block; it sits in the boot sequence. Lifting only the 5524-5583 range would give you a fed watchdog that was never installed. |
 | wake-on-button arming | 5585 onward | required by `SYSTEM_OFF` |
-| `power_off()` | 5664-5720 | clears both LED rows, clears `RESETREAS`, powers down the external chips, then `SYSTEM_OFF` |
+| `power_off()` | 5664-5735 | clears both LED rows, powers down the external chips, then clears `RESETREAS` (5730) and writes `SYSTEMOFF` (5732). REVIEW: the range must extend past 5720 or you get a power-off that never actually powers off. |
+| **`enter_dfu()`** | 5743-5752 | REVIEW: the escape hatch, previously missed. Flushes, lights all four track LEDs as a cue, writes `GPREGRET = 0x57`, resets. |
+| **the `enter_dfu` trigger** | 6981 | Track 1 + Track 4 held 1.2 s in the control loop. Reproduce this in `main.c`: it is the only recovery path that works when the app is running but wedged. |
 | `g_resetreas` capture at boot | 85 and its boot-time read | BIG FIVE requirement |
 
-Drop everything to do with audio, eMMC, I2S, I2C codecs and the looper engine. `board_io_led_set` takes a 0 to 255 level: map it onto whatever the lifted soft-PWM exposes, and if the lifted renderer is on/off only, threshold at 128 for now and note it as a Phase 6 item.
+The button decode, which is the one piece worth reproducing here because a wrong threshold is a silent bug:
 
-One thing that is easy to drop by accident: **charging**. The BQ24232's charge-enable pin (`BQ_NCE_PIN`, P0.21) is active low, so `board_io_init` must drive it low or the puck will never charge over USB-C, which the spec lists as expected behaviour. The status pins (`BQ_NCHG`, `BQ_NPGOOD`) are only needed if you want a charge indicator; that is optional in v1. Verify charging works before leaving this task: plug in USB-C with the firmware running and confirm the battery gains charge over a few minutes.
+```c
+/* Transplanted from sp1-tape-looper firmware/src/main.c:5098-5107 (MIT).
+ * Thresholds are calibrated to the exact ADC configuration in the board
+ * files and app.overlay: gain 1/6, 0.6 V internal reference, 20 us
+ * acquisition, 12-bit. Do not change one without re-measuring the other. */
+int board_io_decode_track_button(int v)
+{
+    if (v <  110) return -1;   /* none           */
+    if (v <  300) return 0;    /* track 1, ~213  */
+    if (v <  560) return 1;    /* track 2, ~403  */
+    if (v <  950) return 2;    /* track 3, ~733  */
+    if (v < 1500) return 3;    /* track 4, ~1220 */
+    return 4;                  /* play,    ~1823 */
+}
+```
+
+Drop everything to do with audio, eMMC, I2S, I2C codecs and the looper engine. `board_io_led_set` takes a 0 to 255 level: map it onto whatever the transplanted soft-PWM exposes, and if the renderer turns out to be on/off only, threshold at 128 for now and note it as a Phase 6 item.
+
+One thing that is easy to drop by accident: **charging**. The BQ24232's charge-enable pin (`BQ_NCE_PIN`, P0.21) is active low, so `board_io_init` must drive it low or the puck will never charge over USB-C, which the spec lists as expected behaviour. Verify before leaving this task, with an actual measurement rather than an impression: read the battery ADC (`LAD_BATT`, AIN4) over the console, note the raw code, leave USB-C connected for 15 minutes with the firmware running, and confirm the code has risen. Alternatively read the BQ24232's `nCHG` pin (P0.22, open-drain, LOW while charging) and confirm it is low. "It seems to charge" is not a check.
 
 - [ ] **Step 7: Write `firmware/src/main.c`**
 
@@ -756,7 +832,7 @@ Expected: a clean build producing a `zephyr.bin` well under `0xDF000`.
 
 - [ ] **Step 9: Flash and verify on the dev puck**
 
-Bootloader mode, flash `build/zephyr/zephyr.bin` with the firmware utility. Expected: LED 0 blinks at 1 Hz; holding the function button for 2.5 s powers the device off with all LEDs dark; the puck powers back on normally; bootloader mode still works.
+Bootloader mode, flash `build/zephyr/zephyr.bin` with the firmware utility. Expected: LED 0 blinks at 1 Hz; holding the function button for 2.5 s powers the device off with all LEDs dark; the puck powers back on normally; USB-C charges it; bootloader mode still works.
 
 **STOP RULE:** if the puck boots but cannot re-enter bootloader mode, this is the BIG FIVE failing. Recover via the drill from Task 1.1 and do not proceed until it works.
 
@@ -764,42 +840,22 @@ Bootloader mode, flash `build/zephyr/zephyr.bin` with the firmware utility. Expe
 
 ```bash
 git add boards firmware
-git commit -m "feat: bootable skeleton with watchdog, LEDs and clean power-off"
+git commit -m "feat: bootable skeleton with watchdog, LEDs, charging and clean power-off"
 ```
 
 ---
 
-### Task 2.2: Button and fader reads over the console
+### Task 2.2: Characterise the faders and buttons on real hardware
+
+The spec's revised risk note is explicit: the faders are absolute-position sensors (Codex verified), and the real unknowns are resolution, jitter, touch and release behaviour, dead zones and calibration. Size the deadband from data measured here, not from the default.
 
 **Files:**
 - Modify: `firmware/src/main.c`
-- Modify: `firmware/src/board_io.c`
-- Modify: `firmware/src/board_io.h`
+- Modify: `docs/hardware-notes.md`
 
-**Interfaces:**
-- Produces: `int board_io_decode_track_button(int raw);` returning -1 for none, 0 to 3 for the track buttons, 4 for play. Phase 5 consumes it.
+- [ ] **Step 1: Add a diagnostic loop to `main.c`**
 
-- [ ] **Step 1: Add the decode function to `board_io.c`, lifted from main.c:5098-5107**
-
-```c
-/* Lifted from sp1-tape-looper firmware/src/main.c:5098-5107 (MIT).
- * Thresholds are calibrated to the exact ADC configuration in the board
- * files and app.overlay: gain 1/6, 0.6 V internal reference, 20 us
- * acquisition, 12-bit. Do not change one without re-measuring the other. */
-int board_io_decode_track_button(int v)
-{
-    if (v <  110) return -1;   /* none          */
-    if (v <  300) return 0;    /* track 1, ~213  */
-    if (v <  560) return 1;    /* track 2, ~403  */
-    if (v <  950) return 2;    /* track 3, ~733  */
-    if (v < 1500) return 3;    /* track 4, ~1220 */
-    return 4;                  /* play,    ~1823 */
-}
-```
-
-- [ ] **Step 2: Add a diagnostic loop to `main.c`**
-
-Replace the heartbeat block with this, keeping it behind `SP1_DIAG` so the release build in Phase 8 compiles it out:
+Behind `SP1_DIAG` so the release build in Phase 8 compiles it out:
 
 ```c
 #define SP1_DIAG 1
@@ -817,7 +873,7 @@ Replace the heartbeat block with this, keeping it behind `SP1_DIAG` so the relea
 #endif
 ```
 
-- [ ] **Step 3: Build, flash, and read the console**
+- [ ] **Step 2: Build, flash, and read the console**
 
 ```bash
 west build -p -b stem_player firmware -- -DBOARD_ROOT=$(pwd)
@@ -826,19 +882,29 @@ ls /dev/tty.usbmodem*
 screen /dev/tty.usbmodem<id> 115200
 ```
 
-- [ ] **Step 4: Verify against expectations, and record**
+- [ ] **Step 3: Measure, do not eyeball**
 
-Sweep each fader end to end. Expected per fader: a minimum near 0 and a maximum near 3700, monotonic, jitter of only a few counts when untouched. Press each track button and play. Expected: the decoded index matches the physical button, and releasing returns -1.
+Capture the console to a file and work out, per fader:
+- **Range:** minimum and maximum raw code at the physical extremes. Expected near 0 and near 3700.
+- **Jitter at rest:** leave everything untouched for 30 seconds and record the peak-to-peak spread. The looper reports plus or minus 1 count (`main.c:2685`); this is the number that sizes the deadband.
+- **Dead zones:** sweep slowly end to end and look for raw values that never appear, or plateaus where the reading stops tracking the finger.
+- **Touch and release:** does the reading hold when the finger lifts, or does it jump to a rest value? A jump on release would make these gesture sensors rather than positions, and Phase 4 would need rethinking.
 
-Write the observed minimum and maximum for each fader into `docs/hardware-notes.md`. If any fader's full-scale differs from 3700 by more than about 5 percent, change `FADER_RAW_FULL` in Task 4.1 to the measured value and say so in the notes.
+- [ ] **Step 4: Size the deadband and record**
 
-This step also answers the spec's open risk about whether the faders are absolute or relative: they are absolute analog positions on the SAADC. If a fader instead reads as a jumpy relative sensor, stop and re-plan Phase 4 as pickup mode.
+Set `FADER_DEADBAND_RAW` (Task 4.1) to about 4x the measured peak-to-peak jitter, with 8 as the default if jitter is the expected plus or minus 1. Keep it well under one 7-bit step, which is about 29 raw counts. Write every measured number into `docs/hardware-notes.md`, along with the chosen deadband and the reasoning.
 
-- [ ] **Step 5: Commit**
+If a fader's full-scale differs from 3700 by more than about 5 percent, change `FADER_RAW_FULL` to the measured value and say so.
+
+- [ ] **Step 5: Verify the buttons**
+
+Press each track button and play. Expected: the decoded index matches the physical button and releasing returns -1. Note any button whose raw code sits near a threshold boundary.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add firmware/src docs/hardware-notes.md
-git commit -m "feat: fader and button ladder reads, verified over the console"
+git commit -m "feat: fader and button reads, characterised on hardware"
 ```
 
 ---
@@ -859,7 +925,7 @@ Record, for each index, its physical position. Confirm whether any LED sits next
 
 - [ ] **Step 3: Check brightness control**
 
-Set levels 32, 128 and 255 on centre LED 0 for two seconds each. Expected: visibly different brightness. If the lifted renderer is on/off only, note that Phase 6 must render value as a blink rate or a bar across the four centre LEDs instead.
+Set levels 32, 128 and 255 on centre LED 0 for two seconds each. Expected: visibly different brightness. If the renderer is on/off only, note that Phase 6 must render value as a blink rate or a bar across the four centre LEDs instead.
 
 - [ ] **Step 4: Revert the diagnostic, keep the notes, commit**
 
@@ -870,9 +936,9 @@ git commit -m "docs: LED map and brightness capability surveyed on hardware"
 
 ---
 
-# Phase 3: MIDI transmit
+# Phase 3: Transmit path
 
-The end-to-end proof. After this task the puck moves a parameter on the synth.
+The end-to-end proof, plus the queue that keeps the wire honest.
 
 ### Task 3.1: Bit-banged TRS MIDI transmitter
 
@@ -895,8 +961,8 @@ The end-to-end proof. After this task the puck moves a parameter on the synth.
  * The sync jack's ring is driven by P0.23 (BC807 base) through a PNP that
  * INVERTS the line, so the waveform is bit-banged rather than handed to a
  * UART peripheral. A hardware timer clocks one bit per ISR with interrupts
- * left on. Lifted from sp1-tape-looper firmware/src/main.c:4398-4530 (MIT).
- */
+ * left on. Transplanted from sp1-tape-looper firmware/src/main.c:4398-4530
+ * (MIT). */
 #ifndef SP1_MIDI_TX_H
 #define SP1_MIDI_TX_H
 
@@ -911,7 +977,7 @@ void midi_tx_cc(uint8_t channel, uint8_t cc, uint8_t value);
 
 - [ ] **Step 2: Write `firmware/src/midi_tx.c`**
 
-Lift `midi_pins_init`, `midi_line`, `midi_timer_isr`, `midi_timer_init` and `midi_send` from `main.c:4419-4530` unchanged, keeping the constants:
+Transplant `midi_pins_init`, `midi_line`, `midi_timer_isr`, `midi_timer_init` and `midi_send` from `main.c:4419-4530` unchanged, keeping the constants:
 
 ```c
 #define MIDI_PIN     23u   /* P0.23 BC807 base, drives SYNC_RING */
@@ -934,11 +1000,26 @@ void midi_tx_cc(uint8_t channel, uint8_t cc, uint8_t value)
 }
 ```
 
-`midi_tx_byte` is the lifted `midi_send`, renamed. Note in a comment that a three-byte CC occupies roughly 1 ms on the wire at 31250 baud, which is why the burst spacing in Phase 5 is 1 to 2 ms.
+`midi_tx_init` is not free either: REVIEW flagged that the plan called it without defining it. It must call the transplanted `midi_pins_init()` and `midi_timer_init()`, initialise the `midi_tx_done` semaphore, and (from Task 3.2) start the drain thread:
+
+```c
+void midi_tx_init(void)
+{
+    midi_pins_init();     /* transplanted, main.c:4443-4460 */
+    midi_timer_init();    /* transplanted, main.c:4515-4527 */
+    txq_init(&tx_q);
+    k_mutex_init(&tx_lock);
+    k_sem_init(&tx_wake, 0, 1);
+    k_thread_create(&tx_tcb, tx_stack, MIDI_TX_STACK, midi_tx_thread,
+                    NULL, NULL, NULL, MIDI_TX_PRIO, 0, K_NO_WAIT);
+}
+```
+
+`midi_tx_byte` is the transplanted `midi_send`, renamed. Note in a comment that each byte occupies 320 us on the wire (10 bits at 32 us), so a three-byte CC is just under 1 ms. That number is the basis of the queue sizing in Task 3.2.
 
 - [ ] **Step 3: Add a MIDI smoke test to `main.c`**
 
-Behind `#define SP1_DIAG 1`, send `midi_tx_cc(0, 102, v)` once every 100 ms with `v` ramping 0 to 127 and back, so cutoff sweeps continuously without touching anything.
+Behind `SP1_DIAG`, send `midi_tx_cc(0, 102, v)` once every 100 ms with `v` ramping 0 to 127 and back, so cutoff sweeps continuously without touching anything.
 
 - [ ] **Step 4: Build and flash**
 
@@ -952,7 +1033,7 @@ Same rig as Task 1.3. Expected: a stream of `channel 1 control-change 102` messa
 
 - [ ] **Step 6: Verify on the Tiliqua**
 
-SP-1 into the Tiliqua MIDI-in with popgoblin running. Expected: the on-screen MIDI activity indicator lights (`gateware/src/rs/lib/src/ui.rs:57`, shown while activity is under 100 ms old) and the cutoff option value sweeps on the display. This is the end-to-end proof the spec's v0 was after.
+SP-1 into the Tiliqua MIDI-in with popgoblin running. Expected: the cutoff option value sweeps on the display, and the MIDI activity indicator shows traffic. REVIEW: that indicator drives the motherboard LEDs via the PCA9635 (`gateware/src/rs/lib/src/ui.rs:115`), not an on-screen glyph, so watch the hardware LEDs rather than hunting for something on the video output. The moving cutoff value is the unambiguous signal either way. This is the end-to-end proof the spec's v0 was after.
 
 - [ ] **Step 7: Record and commit**
 
@@ -965,9 +1046,324 @@ git commit -m "feat: bit-banged TRS MIDI TX, cutoff sweep confirmed on the synth
 
 ---
 
+### Task 3.2: The coalescing transmit queue
+
+The spec is specific about this: one queue, latest value per CC wins, never a blocking polled send from the control loop. Four faders at one message per 10 ms each would be 400 messages per second against a wire that carries about 1000, and a preset burst on top of a sweep would queue behind it. Coalescing makes the queue depth bounded by the number of distinct CCs in flight rather than by how fast a finger moves.
+
+**Files:**
+- Create: `firmware/src/txqueue.h`
+- Create: `firmware/src/txqueue.c`
+- Create: `tests/host/test_txqueue.c`
+- Modify: `tests/host/Makefile`
+- Modify: `firmware/src/midi_tx.c` (add the drain thread)
+
+**Interfaces:**
+- Produces:
+  - `void txq_init(txqueue_t *q);`
+  - `bool txq_push(txqueue_t *q, cc_msg_t m);`
+  - `bool txq_pop(txqueue_t *q, cc_msg_t *out);`
+  - `uint8_t txq_count(const txqueue_t *q);`
+  - and in `midi_tx.h`: `void midi_tx_send(cc_msg_t m);`, the only function the rest of the firmware calls to transmit.
+
+Note the dependency direction: `txqueue.h` includes `profile.h` for `cc_msg_t`, which is why `cc_msg_t` is declared in `profile.h` (Task 4.2) rather than in `buttons.h`.
+
+- [ ] **Step 1: Write the failing test, `tests/host/test_txqueue.c`**
+
+```c
+#include "txqueue.h"
+#include "test_util.h"
+
+static txqueue_t q;
+
+static void test_fifo_order(void)
+{
+    txq_init(&q);
+    CHECK(txq_push(&q, (cc_msg_t){ 0, 102, 10 }));
+    CHECK(txq_push(&q, (cc_msg_t){ 0, 104, 20 }));
+    CHECK_EQ(txq_count(&q), 2);
+
+    cc_msg_t m;
+    CHECK(txq_pop(&q, &m));
+    CHECK_EQ(m.cc, 102);
+    CHECK(txq_pop(&q, &m));
+    CHECK_EQ(m.cc, 104);
+    CHECK(!txq_pop(&q, &m));
+}
+
+/* The whole point: a fader swept faster than the wire drains must not
+ * queue every intermediate value. The newest value replaces the pending
+ * one and the queue depth stays at 1. */
+static void test_same_cc_coalesces_to_the_latest_value(void)
+{
+    txq_init(&q);
+    for (uint8_t v = 0; v < 100; v++) {
+        CHECK(txq_push(&q, (cc_msg_t){ 0, 102, v }));
+    }
+    CHECK_EQ(txq_count(&q), 1);
+
+    cc_msg_t m;
+    CHECK(txq_pop(&q, &m));
+    CHECK_EQ(m.value, 99);
+}
+
+/* Coalescing must not reorder: a busy fader cannot push a waiting button
+ * message to the back of the queue forever. */
+static void test_coalescing_keeps_queue_position(void)
+{
+    txq_init(&q);
+    txq_push(&q, (cc_msg_t){ 0, 102, 1 });
+    txq_push(&q, (cc_msg_t){ 0,  64, 127 });
+    txq_push(&q, (cc_msg_t){ 0, 102, 9 });
+    CHECK_EQ(txq_count(&q), 2);
+
+    cc_msg_t m;
+    CHECK(txq_pop(&q, &m));
+    CHECK_EQ(m.cc, 102);
+    CHECK_EQ(m.value, 9);
+    CHECK(txq_pop(&q, &m));
+    CHECK_EQ(m.cc, 64);
+}
+
+static void test_same_cc_on_a_different_channel_is_a_different_message(void)
+{
+    txq_init(&q);
+    txq_push(&q, (cc_msg_t){ 0, 102, 1 });
+    txq_push(&q, (cc_msg_t){ 1, 102, 2 });
+    CHECK_EQ(txq_count(&q), 2);
+}
+
+static void test_full_queue_rejects_new_but_still_coalesces(void)
+{
+    txq_init(&q);
+    for (uint8_t i = 0; i < TXQ_MAX; i++) {
+        CHECK(txq_push(&q, (cc_msg_t){ 0, (uint8_t)(1 + i), i }));
+    }
+    CHECK_EQ(txq_count(&q), TXQ_MAX);
+
+    /* A brand new CC has nowhere to go. */
+    CHECK(!txq_push(&q, (cc_msg_t){ 0, 99, 5 }));
+    /* One already queued still updates in place. */
+    CHECK(txq_push(&q, (cc_msg_t){ 0, 1, 77 }));
+    CHECK_EQ(txq_count(&q), TXQ_MAX);
+
+    cc_msg_t m;
+    CHECK(txq_pop(&q, &m));
+    CHECK_EQ(m.cc, 1);
+    CHECK_EQ(m.value, 77);
+}
+
+static void test_wraps_around_the_ring(void)
+{
+    txq_init(&q);
+    cc_msg_t m;
+    for (int cycle = 0; cycle < 5; cycle++) {
+        for (uint8_t i = 0; i < TXQ_MAX; i++) {
+            CHECK(txq_push(&q, (cc_msg_t){ 0, (uint8_t)(1 + i), i }));
+        }
+        for (uint8_t i = 0; i < TXQ_MAX; i++) {
+            CHECK(txq_pop(&q, &m));
+            CHECK_EQ(m.cc, 1 + i);
+        }
+        CHECK_EQ(txq_count(&q), 0);
+    }
+}
+
+int main(void)
+{
+    RUN(test_fifo_order);
+    RUN(test_same_cc_coalesces_to_the_latest_value);
+    RUN(test_coalescing_keeps_queue_position);
+    RUN(test_same_cc_on_a_different_channel_is_a_different_message);
+    RUN(test_full_queue_rejects_new_but_still_coalesces);
+    RUN(test_wraps_around_the_ring);
+    TEST_MAIN_END();
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+```bash
+sed -i '' 's/^TESTS := smoke/TESTS := smoke txqueue/' tests/host/Makefile
+make -C tests/host test
+```
+Expected: FAIL, `txqueue.h` not found.
+
+- [ ] **Step 3: Write `firmware/src/txqueue.h`**
+
+```c
+/* PURE. The single coalescing transmit queue.
+ *
+ * Every message the firmware sends goes through here. Pushing a (channel,
+ * cc) that is already pending overwrites its value IN PLACE and keeps its
+ * position, so a fast fader sweep collapses to one message per drain
+ * without ever pushing a waiting button message to the back.
+ *
+ * NOT thread-safe by itself: the control loop pushes and the transmit
+ * thread pops, so both must hold the same mutex (see midi_tx.c). Keeping
+ * the locking out here is what allows host testing. */
+#ifndef SP1_TXQUEUE_H
+#define SP1_TXQUEUE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "profile.h"
+
+/* Sized well above the surface: 4 faders + 4 buttons + a 5-message preset
+ * burst cannot exceed this even if every one is pending at once. */
+#define TXQ_MAX 16
+
+typedef struct {
+    cc_msg_t item[TXQ_MAX];
+    uint8_t  head;
+    uint8_t  count;
+} txqueue_t;
+
+void    txq_init(txqueue_t *q);
+
+/* Returns false only when the queue is full AND the message is new. A
+ * message that coalesces into a pending entry always succeeds. */
+bool    txq_push(txqueue_t *q, cc_msg_t m);
+bool    txq_pop(txqueue_t *q, cc_msg_t *out);
+uint8_t txq_count(const txqueue_t *q);
+
+#endif /* SP1_TXQUEUE_H */
+```
+
+- [ ] **Step 4: Write `firmware/src/txqueue.c`**
+
+```c
+#include "txqueue.h"
+
+void txq_init(txqueue_t *q)
+{
+    q->head  = 0;
+    q->count = 0;
+}
+
+bool txq_push(txqueue_t *q, cc_msg_t m)
+{
+    for (uint8_t i = 0; i < q->count; i++) {
+        uint8_t idx = (uint8_t)((q->head + i) % TXQ_MAX);
+        if (q->item[idx].cc == m.cc && q->item[idx].channel == m.channel) {
+            q->item[idx].value = m.value;
+            return true;
+        }
+    }
+
+    if (q->count >= TXQ_MAX) {
+        return false;
+    }
+
+    uint8_t tail = (uint8_t)((q->head + q->count) % TXQ_MAX);
+    q->item[tail] = m;
+    q->count++;
+    return true;
+}
+
+bool txq_pop(txqueue_t *q, cc_msg_t *out)
+{
+    if (q->count == 0) {
+        return false;
+    }
+    *out    = q->item[q->head];
+    q->head = (uint8_t)((q->head + 1) % TXQ_MAX);
+    q->count--;
+    return true;
+}
+
+uint8_t txq_count(const txqueue_t *q)
+{
+    return q->count;
+}
+```
+
+- [ ] **Step 5: Run the tests**
+
+```bash
+make -C tests/host test
+```
+Expected: PASS for `smoke` and `txqueue`.
+
+- [ ] **Step 6: Add the drain thread to `midi_tx.c`**
+
+```c
+/* The queue and its drain thread. The control loop only ever calls
+ * midi_tx_send, which takes the mutex, pushes, and returns immediately.
+ * The thread does the blocking part: one CC is about 1 ms on the wire.
+ *
+ * Priority: below the LED soft-PWM ISR (which is zero-latency and
+ * unaffected) and above nothing in particular. A cooperative-range
+ * priority would let a long burst starve the control loop, so use a
+ * preemptible priority and let the scheduler interleave. */
+#define MIDI_TX_STACK 512
+#define MIDI_TX_PRIO  7
+/* One message per 5 ms = 200/s, matching popgoblin's drain rate exactly. */
+#define MIDI_TX_SPACING_MS 5
+
+static txqueue_t     tx_q;
+static struct k_mutex tx_lock;
+static struct k_sem   tx_wake;
+static K_THREAD_STACK_DEFINE(tx_stack, MIDI_TX_STACK);
+static struct k_thread tx_tcb;
+
+void midi_tx_send(cc_msg_t m)
+{
+    k_mutex_lock(&tx_lock, K_FOREVER);
+    bool ok = txq_push(&tx_q, m);
+    k_mutex_unlock(&tx_lock);
+    if (ok) {
+        k_sem_give(&tx_wake);
+    }
+    /* A rejected push means 16 distinct CCs are already pending, which
+     * the surface cannot produce. Dropping is correct: the next value
+     * for that CC will coalesce anyway. */
+}
+
+static void midi_tx_thread(void *a, void *b, void *c)
+{
+    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+    for (;;) {
+        cc_msg_t m;
+        k_mutex_lock(&tx_lock, K_FOREVER);
+        bool have = txq_pop(&tx_q, &m);
+        k_mutex_unlock(&tx_lock);
+
+        if (!have) {
+            k_sem_take(&tx_wake, K_FOREVER);
+            continue;
+        }
+
+        midi_tx_cc(m.channel, m.cc, m.value);
+        /* Pace to the RECEIVER, not to the wire. popgoblin's MIDI FIFO is
+         * 8 entries (top.py:150) and its firmware pops exactly one per
+         * 5 ms timer ISR (main.rs:28,100), so anything faster than 200
+         * messages per second can silently overflow it. The wire would
+         * carry ~1000. Coalescing plus this pacing is what keeps a
+         * four-fader sweep inside what the synth can actually absorb. */
+        k_msleep(MIDI_TX_SPACING_MS);
+    }
+}
+```
+
+Initialise all three primitives in `midi_tx_init` and start the thread there. Add `void midi_tx_send(cc_msg_t m);` to `midi_tx.h`, and include `txqueue.h` from it.
+
+- [ ] **Step 7: Verify on hardware that nothing regressed**
+
+Change the Task 3.1 smoke test to call `midi_tx_send((cc_msg_t){0, 102, v})` instead of `midi_tx_cc` directly. Expected: identical behaviour on the monitor and on the synth. Then sweep the ramp faster than the wire (send every 1 ms) and confirm the monitor shows a smooth ramp of roughly one message per millisecond rather than a growing backlog, and that the values arriving are the latest ones rather than a lagging replay.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add firmware/src/txqueue.c firmware/src/txqueue.h firmware/src/midi_tx.c \
+        firmware/src/midi_tx.h tests/host
+git commit -m "feat: coalescing transmit queue with a drain thread"
+```
+
+---
+
 # Phase 4: Faders to CC
 
-### Task 4.1: Fader conditioning, pure logic
+### Task 4.1: Fader conditioning and soft pickup, pure logic
 
 **Files:**
 - Create: `firmware/src/controls.h`
@@ -978,7 +1374,14 @@ git commit -m "feat: bit-banged TRS MIDI TX, cutoff sweep confirmed on the synth
 **Interfaces:**
 - Produces:
   - `uint8_t fader_raw_to_cc(int raw);`
-  - `bool fader_update(fader_state_t *st, int raw, uint32_t now_ms, uint8_t *out_value);`
+  - `bool fader_update(fader_state_t *st, int raw, uint8_t *out_value);`
+  - `void fader_arm_pickup(fader_state_t *st, uint8_t target);`
+  - `bool fader_pickup_armed(const fader_state_t *st);`
+  - `uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms, uint32_t *held_ms_out);`
+
+The press duration is an out-parameter of `btn_update` rather than a separate query, and that is deliberate: see the REVIEW note in Task 5.2.
+
+Note there is no timestamp parameter: rate limiting lives in the transmit queue now, not per fader.
 
 - [ ] **Step 1: Write the failing test, `tests/host/test_controls.c`**
 
@@ -990,85 +1393,212 @@ static void test_raw_to_cc_endpoints(void)
 {
     CHECK_EQ(fader_raw_to_cc(0), 0);
     CHECK_EQ(fader_raw_to_cc(FADER_RAW_FULL), 127);
-    CHECK_EQ(fader_raw_to_cc(FADER_RAW_FULL + 500), 127);  /* clamped */
-    CHECK_EQ(fader_raw_to_cc(-1), 0);                      /* defensive */
+    CHECK_EQ(fader_raw_to_cc(FADER_RAW_FULL + 500), 127);
+    CHECK_EQ(fader_raw_to_cc(-1), 0);
 }
 
 static void test_raw_to_cc_midpoint(void)
 {
-    /* 1850 of 3700 is exactly half scale; rounded, that is 64. */
     CHECK_EQ(fader_raw_to_cc(1850), 64);
 }
 
-static void test_first_update_always_emits(void)
+/* The puck must be silent at power-on: it has no idea what the synth is
+ * set to, and blasting four CCs from wherever the faders happen to sit
+ * would stamp on the current patch. The first reading only seeds. */
+static void test_first_reading_seeds_silently(void)
 {
     fader_state_t st = {0};
     uint8_t v = 0xFF;
-    CHECK(fader_update(&st, 0, 1000, &v));
-    CHECK_EQ(v, 0);
+    CHECK(!fader_update(&st, 2000, &v));
+    CHECK_EQ(v, 0xFF);
+}
+
+static void test_first_real_move_emits(void)
+{
+    fader_state_t st = {0};
+    uint8_t v = 0;
+    CHECK(!fader_update(&st, 2000, &v));
+    CHECK(fader_update(&st, 2100, &v));
+    CHECK_EQ(v, fader_raw_to_cc(2100));
 }
 
 static void test_adc_error_never_emits(void)
 {
     fader_state_t st = {0};
     uint8_t v = 0;
-    CHECK(!fader_update(&st, -1, 1000, &v));
+    CHECK(!fader_update(&st, -1, &v));
+    CHECK(!st.have_seed);
 }
 
 static void test_jitter_inside_deadband_is_ignored(void)
 {
     fader_state_t st = {0};
     uint8_t v = 0;
-    CHECK(fader_update(&st, 1000, 0, &v));            /* first emission */
-    CHECK(!fader_update(&st, 1004, 100, &v));         /* +4 counts */
-    CHECK(!fader_update(&st, 996,  200, &v));         /* -4 counts */
-}
-
-static void test_real_move_emits_after_deadband(void)
-{
-    fader_state_t st = {0};
-    uint8_t v = 0;
-    CHECK(fader_update(&st, 1000, 0, &v));
-    uint8_t first = v;
-    CHECK(fader_update(&st, 1100, 100, &v));
-    CHECK(v != first);
-}
-
-static void test_rate_limit_holds_then_releases(void)
-{
-    fader_state_t st = {0};
-    uint8_t v = 0;
-    CHECK(fader_update(&st, 1000, 0, &v));
-    /* A large move 3 ms later is suppressed by the 10 ms per-fader limit. */
-    CHECK(!fader_update(&st, 1400, 3, &v));
-    /* The same position at 12 ms goes out: the move is retried, not lost. */
-    CHECK(fader_update(&st, 1400, 12, &v));
-    CHECK_EQ(v, fader_raw_to_cc(1400));
+    CHECK(!fader_update(&st, 1000, &v));
+    CHECK(!fader_update(&st, 1004, &v));
+    CHECK(!fader_update(&st, 996,  &v));
 }
 
 static void test_same_cc_value_is_not_resent(void)
 {
     fader_state_t st = {0};
     uint8_t v = 0;
-    /* A 7-bit step spans about 29 raw counts, and CC 34 covers raw 976 to
-     * 1005. Moving from 980 to 1000 clears the deadband but stays inside
-     * that one bucket, so nothing goes out. Pick the pair from the bucket
-     * arithmetic, not by eye: 1000 to 1020 crosses into CC 35. */
-    CHECK(fader_update(&st, 980, 0, &v));
+    CHECK(!fader_update(&st, 976, &v));
+    CHECK(fader_update(&st, 1000, &v));
     CHECK_EQ(v, 34);
-    CHECK(!fader_update(&st, 1000, 500, &v));
+    /* 1005 is still inside CC 34's bucket (976 to 1005). */
+    CHECK(!fader_update(&st, 1005, &v));
+}
+
+/* --- soft pickup after a preset recall --- */
+
+static void test_pickup_suppresses_until_the_fader_crosses(void)
+{
+    fader_state_t st = {0};
+    uint8_t v = 0;
+    CHECK(!fader_update(&st, 300, &v));          /* seed low */
+    CHECK(fader_update(&st, 400, &v));           /* now sending, cc ~14 */
+
+    fader_arm_pickup(&st, 100);                  /* recall put the synth at 100 */
+    CHECK(fader_pickup_armed(&st));
+
+    /* Moving up but still well below 100: nothing goes out. */
+    CHECK(!fader_update(&st, 1000, &v));
+    CHECK(!fader_update(&st, 2000, &v));
+    CHECK(fader_pickup_armed(&st));
+
+    /* Crossing the recalled value catches it and takes over. */
+    CHECK(fader_update(&st, 3000, &v));
+    CHECK(!fader_pickup_armed(&st));
+    CHECK_EQ(v, fader_raw_to_cc(3000));
+}
+
+static void test_pickup_not_armed_when_already_at_the_target(void)
+{
+    fader_state_t st = {0};
+    uint8_t v = 0;
+    CHECK(!fader_update(&st, 1000, &v));
+    CHECK(fader_update(&st, 1100, &v));
+    fader_arm_pickup(&st, st.last_sent);
+    CHECK(!fader_pickup_armed(&st));
+}
+
+static void test_pickup_from_above_also_catches(void)
+{
+    fader_state_t st = {0};
+    uint8_t v = 0;
+    CHECK(!fader_update(&st, 3600, &v));
+    CHECK(fader_update(&st, 3500, &v));
+    fader_arm_pickup(&st, 40);
+    CHECK(fader_pickup_armed(&st));
+    CHECK(!fader_update(&st, 2000, &v));         /* cc ~69, still above 40 */
+    CHECK(fader_update(&st, 900, &v));           /* cc ~31, crossed below */
+    CHECK(!fader_pickup_armed(&st));
+}
+
+static void test_arming_pickup_adopts_the_recalled_value(void)
+{
+    fader_state_t st = {0};
+    uint8_t v = 0;
+    CHECK(!fader_update(&st, 1000, &v));
+    CHECK(fader_update(&st, 1100, &v));
+    fader_arm_pickup(&st, 77);
+    CHECK_EQ(st.last_sent, 77);
+}
+
+/* --- buttons --- */
+
+static void test_press_then_short_release_is_a_tap(void)
+{
+    btn_state_t st = {0};
+    uint32_t h;
+    CHECK_EQ(btn_update(&st, true,  0,   &h), BTN_EV_PRESS);
+    CHECK_EQ(btn_update(&st, true,  50,  &h), 0);
+    CHECK_EQ(btn_update(&st, false, 120, &h), BTN_EV_RELEASE | BTN_EV_TAP);
+}
+
+/* THE REGRESSION THAT MATTERS: the release event must carry the real press
+ * duration. An earlier design read the duration with a second call after
+ * btn_update had already cleared the timer, so every release reported 0 ms
+ * and the momentary-pedal branch was unreachable: a long hold latched
+ * freeze instead of releasing it. */
+static void test_release_reports_the_real_press_duration(void)
+{
+    btn_state_t st = {0};
+    uint32_t h = 0xFFFFFFFFu;
+    CHECK_EQ(btn_update(&st, true, 1000, &h), BTN_EV_PRESS);
+    CHECK_EQ(h, 0);
+    CHECK_EQ(btn_update(&st, true, 1500, &h), 0);
+    CHECK_EQ(h, 500);
+    /* 900 ms is a release, and also a TAP in the sense that no 2 s
+     * hold fired. The pedal decision is made from h, NOT from the TAP
+     * flag: that is exactly the distinction this test pins down. */
+    CHECK_EQ(btn_update(&st, false, 1900, &h), BTN_EV_RELEASE | BTN_EV_TAP);
+    CHECK_EQ(h, 900);
+    CHECK(h >= BTN_MOMENTARY_MS);
+}
+
+static void test_hold_fires_once_and_release_is_not_a_tap(void)
+{
+    btn_state_t st = {0};
+    uint32_t h;
+    CHECK_EQ(btn_update(&st, true, 0, &h), BTN_EV_PRESS);
+    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS - 1, &h), 0);
+    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS, &h), BTN_EV_HOLD);
+    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS + 500, &h), 0);
+    CHECK_EQ(btn_update(&st, false, BTN_HOLD_MS + 600, &h), BTN_EV_RELEASE);
+}
+
+static void test_held_ms_measures_from_the_press(void)
+{
+    btn_state_t st = {0};
+    uint32_t h;
+    btn_update(&st, true, 1000, &h);
+    btn_update(&st, true, 1350, &h);
+    CHECK_EQ(h, 350);
+}
+
+/* The control loop's uptime counter is 32-bit milliseconds, which wraps
+ * after about 49 days. Unsigned subtraction makes the wrap a non-event,
+ * but only if nobody compares timestamps directly. */
+static void test_hold_detection_survives_the_millisecond_wrap(void)
+{
+    btn_state_t st = {0};
+    uint32_t h, near_wrap = 0xFFFFFF00u;
+    CHECK_EQ(btn_update(&st, true, near_wrap, &h), BTN_EV_PRESS);
+    CHECK_EQ(btn_update(&st, true, near_wrap + 100u, &h), 0);
+    CHECK_EQ(h, 100);
+    CHECK_EQ(btn_update(&st, true, near_wrap + BTN_HOLD_MS, &h), BTN_EV_HOLD);
+    CHECK_EQ(h, BTN_HOLD_MS);
+}
+
+static void test_idle_button_reports_nothing(void)
+{
+    btn_state_t st = {0};
+    uint32_t h;
+    CHECK_EQ(btn_update(&st, false, 0, &h), 0);
+    CHECK_EQ(btn_update(&st, false, 5000, &h), 0);
 }
 
 int main(void)
 {
     RUN(test_raw_to_cc_endpoints);
     RUN(test_raw_to_cc_midpoint);
-    RUN(test_first_update_always_emits);
+    RUN(test_first_reading_seeds_silently);
+    RUN(test_first_real_move_emits);
     RUN(test_adc_error_never_emits);
     RUN(test_jitter_inside_deadband_is_ignored);
-    RUN(test_real_move_emits_after_deadband);
-    RUN(test_rate_limit_holds_then_releases);
     RUN(test_same_cc_value_is_not_resent);
+    RUN(test_pickup_suppresses_until_the_fader_crosses);
+    RUN(test_pickup_not_armed_when_already_at_the_target);
+    RUN(test_pickup_from_above_also_catches);
+    RUN(test_arming_pickup_adopts_the_recalled_value);
+    RUN(test_press_then_short_release_is_a_tap);
+    RUN(test_release_reports_the_real_press_duration);
+    RUN(test_hold_fires_once_and_release_is_not_a_tap);
+    RUN(test_held_ms_measures_from_the_press);
+    RUN(test_hold_detection_survives_the_millisecond_wrap);
+    RUN(test_idle_button_reports_nothing);
     TEST_MAIN_END();
 }
 ```
@@ -1076,7 +1606,7 @@ int main(void)
 - [ ] **Step 2: Run it and watch it fail**
 
 ```bash
-sed -i '' 's/^TESTS := smoke/TESTS := smoke controls/' tests/host/Makefile
+sed -i '' 's/^TESTS := smoke txqueue/TESTS := smoke txqueue controls/' tests/host/Makefile
 make -C tests/host test
 ```
 Expected: FAIL, `controls.h` not found.
@@ -1092,34 +1622,47 @@ Expected: FAIL, `controls.h` not found.
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Full-scale raw code of a fader on the 12-bit SAADC as configured in
- * app.overlay. Measured on hardware in Task 2.2; the looper uses the same
- * number (main.c:7487). */
 #define FADER_RAW_FULL          3700
-
-/* Raw counts a fader must move past its last emitted position before a new
- * value is considered. One 7-bit step is about 29 raw counts, so 8 rejects
- * ADC jitter without adding perceptible lag. */
 #define FADER_DEADBAND_RAW      8
-
-/* Minimum spacing between messages from a single fader. */
-#define FADER_MIN_INTERVAL_MS   10
 
 typedef struct {
     int      last_raw;
     uint8_t  last_sent;
+    bool     have_seed;
     bool     have_sent;
-    uint32_t last_send_ms;
+    bool     pickup_armed;
+    uint8_t  pickup_target;
+    int8_t   pickup_side;
 } fader_state_t;
 
-/* Scale a raw SAADC code to a 7-bit CC value, rounded and clamped. */
 uint8_t fader_raw_to_cc(int raw);
+bool fader_update(fader_state_t *st, int raw, uint8_t *out_value);
+void fader_arm_pickup(fader_state_t *st, uint8_t target);
+bool fader_pickup_armed(const fader_state_t *st);
 
-/* Feed one reading. Returns true when a CC should be transmitted, and then
- * writes the value to out_value. A negative raw (ADC error) never emits.
- * A move suppressed by the rate limit is retried on the next call rather
- * than dropped, so the final resting position is always sent. */
-bool fader_update(fader_state_t *st, int raw, uint32_t now_ms, uint8_t *out_value);
+#define BTN_HOLD_MS        2000
+#define BTN_MOMENTARY_MS   400
+
+#define BTN_EV_PRESS    0x01u
+#define BTN_EV_HOLD     0x02u
+#define BTN_EV_TAP      0x04u
+#define BTN_EV_RELEASE  0x08u
+
+typedef struct {
+    bool     down;
+    bool     hold_fired;
+    uint32_t down_at_ms;
+} btn_state_t;
+
+/* Feed the debounced pressed/released state once per control pass.
+ *
+ * held_ms_out ALWAYS receives the duration of the press this event refers
+ * to, including on the release pass. It is an out-parameter rather than a
+ * separate btn_held_ms() call precisely because the release clears the
+ * timer: a caller that asked afterwards would always read zero, and the
+ * momentary-pedal branch would be unreachable. */
+uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms,
+                   uint32_t *held_ms_out);
 
 #endif /* SP1_CONTROLS_H */
 ```
@@ -1146,39 +1689,100 @@ static int abs_diff(int a, int b)
     return d < 0 ? -d : d;
 }
 
-bool fader_update(fader_state_t *st, int raw, uint32_t now_ms, uint8_t *out_value)
+bool fader_update(fader_state_t *st, int raw, uint8_t *out_value)
 {
     if (raw < 0) {
-        return false;               /* ADC error: hold the last value */
+        return false;
     }
 
-    if (!st->have_sent) {
-        st->last_raw      = raw;
-        st->last_sent     = fader_raw_to_cc(raw);
-        st->have_sent     = true;
-        st->last_send_ms  = now_ms;
-        *out_value        = st->last_sent;
-        return true;
+    if (!st->have_seed) {
+        st->have_seed = true;
+        st->last_raw  = raw;
+        return false;
     }
 
     if (abs_diff(raw, st->last_raw) < FADER_DEADBAND_RAW) {
         return false;
     }
+    st->last_raw = raw;
 
     uint8_t v = fader_raw_to_cc(raw);
-    if (v == st->last_sent) {
+    if (st->have_sent && v == st->last_sent) {
         return false;
     }
 
-    if ((uint32_t)(now_ms - st->last_send_ms) < FADER_MIN_INTERVAL_MS) {
-        return false;               /* retried on the next pass */
+    if (st->pickup_armed) {
+        int side = (v > st->pickup_target) - (v < st->pickup_target);
+        if (side != 0 && side == st->pickup_side) {
+            return false;
+        }
+        st->pickup_armed = false;
     }
 
-    st->last_raw     = raw;
-    st->last_sent    = v;
-    st->last_send_ms = now_ms;
-    *out_value       = v;
+    st->last_sent = v;
+    st->have_sent = true;
+    *out_value    = v;
     return true;
+}
+
+void fader_arm_pickup(fader_state_t *st, uint8_t target)
+{
+    uint8_t cur = st->have_sent ? st->last_sent
+                                : fader_raw_to_cc(st->last_raw);
+
+    st->last_sent = target;
+    st->have_sent = true;
+
+    if (!st->have_seed || cur == target) {
+        st->pickup_armed = false;
+        return;
+    }
+
+    st->pickup_target = target;
+    st->pickup_side   = (cur > target) ? 1 : -1;
+    st->pickup_armed  = true;
+}
+
+bool fader_pickup_armed(const fader_state_t *st)
+{
+    return st->pickup_armed;
+}
+
+uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms,
+                   uint32_t *held_ms_out)
+{
+    uint8_t ev = 0;
+    uint32_t held = st->down ? (uint32_t)(now_ms - st->down_at_ms) : 0u;
+
+    if (pressed_now && !st->down) {
+        st->down       = true;
+        st->hold_fired = false;
+        st->down_at_ms = now_ms;
+        *held_ms_out   = 0u;
+        return BTN_EV_PRESS;
+    }
+
+    if (pressed_now && st->down) {
+        if (!st->hold_fired && held >= BTN_HOLD_MS) {
+            st->hold_fired = true;
+            ev |= BTN_EV_HOLD;
+        }
+        *held_ms_out = held;
+        return ev;
+    }
+
+    if (!pressed_now && st->down) {
+        st->down = false;
+        ev = BTN_EV_RELEASE;
+        if (!st->hold_fired) {
+            ev |= BTN_EV_TAP;
+        }
+        *held_ms_out = held;   /* measured BEFORE the state was cleared */
+        return ev;
+    }
+
+    *held_ms_out = 0u;
+    return 0;
 }
 ```
 
@@ -1187,15 +1791,13 @@ bool fader_update(fader_state_t *st, int raw, uint32_t now_ms, uint8_t *out_valu
 ```bash
 make -C tests/host test
 ```
-Expected: PASS for both `smoke` and `controls`. Every test in this task and in Tasks 4.2, 5.1, 5.2 and 7.1 was compiled and run against exactly this implementation while the plan was written, with `-Wall -Wextra -Werror`, so a failure here means a transcription slip rather than a design problem.
-
-A note on the deadband, since the two constants interact: `FADER_DEADBAND_RAW` (8) is deliberately smaller than one 7-bit step (about 29 raw counts). It is not what stops repeat sends; the `v == st->last_sent` check is. The deadband exists to stop the arithmetic running at all on noise, and it is anchored to the last *emitted* raw position rather than the last reading, so a fader parked exactly on a bucket boundary can only oscillate if its jitter exceeds 8 counts. The looper measured that jitter at plus or minus 1 (`main.c:2685`), leaving 8x of margin. If Task 2.2 measures worse on this unit, raise the constant and re-run these tests.
+Expected: PASS for `smoke`, `txqueue` and `controls`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add firmware/src/controls.c firmware/src/controls.h tests/host
-git commit -m "feat: fader conditioning with deadband and per-fader rate limit"
+git commit -m "feat: fader conditioning, silent boot and soft pickup"
 ```
 
 ---
@@ -1209,30 +1811,33 @@ git commit -m "feat: fader conditioning with deadband and per-fader rate limit"
 - Modify: `tests/host/Makefile`
 
 **Interfaces:**
-- Produces: `profile_t`, `fader_cfg_t`, `button_cfg_t`, `btn_mode_t`, and `extern const profile_t profile_popgoblin_default;`. Phases 5, 6 and 7 all read this table and never hard-code a CC number.
+- Produces: `cc_msg_t`, `profile_t`, `fader_cfg_t`, `button_cfg_t`, `btn_mode_t`, and `extern const profile_t profile_popgoblin_default;`. Everything downstream reads this table and never hard-codes a CC number.
+
+Mode names follow the spec's vocabulary: *toggle* (freeze), *cycle* (shimmer), *preset*.
 
 - [ ] **Step 1: Write the failing test, `tests/host/test_profile.c`**
 
 ```c
 #include "profile.h"
 #include "test_util.h"
+#include <stdbool.h>
 
 static void test_default_profile_matches_the_spec(void)
 {
     const profile_t *p = &profile_popgoblin_default;
 
-    CHECK_EQ(p->fader[0].cc, 102);   /* filter cutoff  */
-    CHECK_EQ(p->fader[1].cc, 104);   /* reverb wet     */
-    CHECK_EQ(p->fader[2].cc, 107);   /* delay time     */
-    CHECK_EQ(p->fader[3].cc, 108);   /* delay feedback */
+    CHECK_EQ(p->fader[0].cc, 102);
+    CHECK_EQ(p->fader[1].cc, 104);
+    CHECK_EQ(p->fader[2].cc, 107);
+    CHECK_EQ(p->fader[3].cc, 108);
 
     for (int i = 0; i < PROFILE_NUM_FADERS; i++) {
-        CHECK_EQ(p->fader[i].channel, 0);   /* MIDI channel 1 on the wire */
+        CHECK_EQ(p->fader[i].channel, 0);
     }
 
-    CHECK_EQ(p->button[0].mode, BTN_MODE_LATCH_MOMENTARY);
+    CHECK_EQ(p->button[0].mode, BTN_MODE_TOGGLE);
     CHECK_EQ(p->button[0].cc,   64);
-    CHECK_EQ(p->button[1].mode, BTN_MODE_STEP);
+    CHECK_EQ(p->button[1].mode, BTN_MODE_CYCLE);
     CHECK_EQ(p->button[1].cc,   105);
     CHECK_EQ(p->button[1].n_steps, 4);
     CHECK_EQ(p->button[2].mode, BTN_MODE_PRESET);
@@ -1241,22 +1846,33 @@ static void test_default_profile_matches_the_spec(void)
     CHECK_EQ(p->button[3].preset_slot, 1);
 }
 
-static void test_step_values_span_the_range(void)
+/* PopGoblin's ShimmerLevel iterates Boost, Full, Low, Off and set_from_cc
+ * picks index = cc * 4 / 128. So the buckets are Boost 0-31, Full 32-63,
+ * Low 64-95, Off 96-127, and the spec's off -> low -> full -> boost order
+ * means DESCENDING CC values at the bucket centres. Getting this backwards
+ * would silently invert the control. */
+static void test_shimmer_steps_hit_the_right_enum_buckets(void)
 {
     const button_cfg_t *b = &profile_popgoblin_default.button[1];
-    CHECK_EQ(b->steps[0], 0);
-    CHECK_EQ(b->steps[3], 127);
-    for (int i = 1; i < b->n_steps; i++) {
-        CHECK(b->steps[i] > b->steps[i - 1]);
+    CHECK_EQ(b->n_steps, 4);
+
+    const char *name[4] = { "off", "low", "full", "boost" };
+    const int   want[4] = { 3, 2, 1, 0 };   /* enum index the synth will pick */
+    for (int i = 0; i < 4; i++) {
+        int bucket = (b->steps[i] * 4) / 128;
+        (void)name;
+        CHECK_EQ(bucket, want[i]);
     }
+
+    /* And the puck must start where the synth's default is: Full. */
+    CHECK_EQ(b->init_step, 2);
+    CHECK_EQ((b->steps[b->init_step] * 4) / 128, 1);   /* 1 == Full */
 }
 
 static void test_preset_capture_list_uses_existing_ccs_only(void)
 {
     const profile_t *p = &profile_popgoblin_default;
     CHECK_EQ(p->preset_capture_len, 5);
-    /* Every captured CC must be one the surface already drives, and CC 64
-     * (freeze) must never be captured: it is a live gesture, not a scene. */
     for (int i = 0; i < p->preset_capture_len; i++) {
         uint8_t cc = p->preset_capture[i];
         CHECK(cc != 64);
@@ -1272,7 +1888,7 @@ static void test_preset_capture_list_uses_existing_ccs_only(void)
 int main(void)
 {
     RUN(test_default_profile_matches_the_spec);
-    RUN(test_step_values_span_the_range);
+    RUN(test_shimmer_steps_hit_the_right_enum_buckets);
     RUN(test_preset_capture_list_uses_existing_ccs_only);
     TEST_MAIN_END();
 }
@@ -1281,7 +1897,7 @@ int main(void)
 - [ ] **Step 2: Run it and watch it fail**
 
 ```bash
-sed -i '' 's/^TESTS := smoke controls/TESTS := smoke controls profile/' tests/host/Makefile
+sed -i '' 's/^TESTS := smoke txqueue controls/TESTS := smoke txqueue controls profile/' tests/host/Makefile
 make -C tests/host test
 ```
 Expected: FAIL, `profile.h` not found.
@@ -1295,7 +1911,12 @@ Expected: FAIL, `profile.h` not found.
  * below is the shipped default profile, which happens to target the
  * PopGoblin string synth. Changing the surface means changing this table
  * and nothing else. A browser-based editor over WebSerial that rewrites
- * this table at runtime is parked for v1.1. */
+ * this table at runtime is parked for v1.1.
+ *
+ * REVIEW: BTN_MODE_LIST and the per-button list[] exist because the frozen
+ * spec requires "per-button CC list + channel" in the config table. Without
+ * them the engine could emit lists but the table could not describe one, so
+ * the generic-controller requirement was only half met. */
 #ifndef SP1_PROFILE_H
 #define SP1_PROFILE_H
 
@@ -1304,41 +1925,46 @@ Expected: FAIL, `profile.h` not found.
 #define PROFILE_NUM_FADERS   4
 #define PROFILE_NUM_BUTTONS  4
 #define PROFILE_MAX_STEPS    4
-/* Kept in step with PRESET_ENTRIES in presets.h: a scene that does not fit
- * a stored record would be silently truncated. */
 #define PROFILE_MAX_CAPTURE  5
+#define PROFILE_MAX_BTN_LIST 5
+
+typedef struct {
+    uint8_t channel;
+    uint8_t cc;
+    uint8_t value;
+} cc_msg_t;
 
 typedef enum {
-    /* Tap latches the CC on, tap again latches it off; a hold behaves as a
-     * momentary pedal that releases when the finger lifts. */
-    BTN_MODE_LATCH_MOMENTARY = 0,
-    /* Each tap sends the next value in steps[]. */
-    BTN_MODE_STEP = 1,
-    /* Tap replays a stored list of (cc, value) pairs; a long hold stores
-     * the current surface state into that slot. */
-    BTN_MODE_PRESET = 2,
+    BTN_MODE_TOGGLE  = 0,
+    BTN_MODE_CYCLE   = 1,
+    BTN_MODE_PRESET  = 2,
+    /* Emit a fixed list of (cc, value) pairs configured in the table. This
+     * is what makes the surface generic: any button can be any list. */
+    BTN_MODE_LIST    = 3,
 } btn_mode_t;
 
 typedef struct {
     uint8_t cc;
-    uint8_t channel;        /* wire value, 0 to 15 */
+    uint8_t channel;
 } fader_cfg_t;
 
 typedef struct {
     btn_mode_t mode;
     uint8_t    channel;
-    uint8_t    cc;                         /* LATCH_MOMENTARY and STEP */
-    uint8_t    on_value;                   /* LATCH_MOMENTARY: the "on" value */
-    uint8_t    off_value;                  /* LATCH_MOMENTARY: the "off" value */
-    uint8_t    steps[PROFILE_MAX_STEPS];   /* STEP */
-    uint8_t    n_steps;                    /* STEP */
-    uint8_t    preset_slot;                /* PRESET */
+    uint8_t    cc;
+    uint8_t    on_value;
+    uint8_t    off_value;
+    uint8_t    steps[PROFILE_MAX_STEPS];
+    uint8_t    n_steps;
+    uint8_t    init_step;
+    uint8_t    preset_slot;
+    cc_msg_t   list[PROFILE_MAX_BTN_LIST];
+    uint8_t    n_list;
 } button_cfg_t;
 
 typedef struct {
     fader_cfg_t  fader[PROFILE_NUM_FADERS];
     button_cfg_t button[PROFILE_NUM_BUTTONS];
-    /* The CCs a preset snapshot captures and replays, in send order. */
     uint8_t      preset_capture[PROFILE_MAX_CAPTURE];
     uint8_t      preset_capture_len;
 } profile_t;
@@ -1353,34 +1979,33 @@ extern const profile_t profile_popgoblin_default;
 ```c
 #include "profile.h"
 
-/* PopGoblin CC map, read from the synth's own firmware
- * (tiliqua gateware/src/top/popgoblin/fw/src/main.rs:60-70):
- *   102 cutoff, 103 reso, 104 reverb wet, 105 shimmer, 106 chorus rate,
- *   107 delay time, 108 delay feedback, 64 freeze, 43 palette, 51 plot.
- * The synth ignores the channel (it parses ControlChange(_, cc, val)), so
- * channel 0 here is a convention, not a requirement. */
 const profile_t profile_popgoblin_default = {
     .fader = {
-        { .cc = 102, .channel = 0 },   /* filter cutoff        */
-        { .cc = 104, .channel = 0 },   /* reverb wet           */
-        { .cc = 107, .channel = 0 },   /* delay time           */
-        { .cc = 108, .channel = 0 },   /* delay feedback       */
+        { .cc = 102, .channel = 0 },
+        { .cc = 104, .channel = 0 },
+        { .cc = 107, .channel = 0 },
+        { .cc = 108, .channel = 0 },
     },
     .button = {
-        {   /* freeze: the synth holds while the last value seen is >= 64 */
-            .mode = BTN_MODE_LATCH_MOMENTARY, .channel = 0, .cc = 64,
+        {
+            .mode = BTN_MODE_TOGGLE, .channel = 0, .cc = 64,
             .on_value = 127, .off_value = 0,
         },
-        {   /* shimmer: a 4-step option, so send one value per quarter of
-             * the 7-bit range and let the synth bucket it */
-            .mode = BTN_MODE_STEP, .channel = 0, .cc = 105,
-            .steps = { 0, 42, 85, 127 }, .n_steps = 4,
+        {
+            /* shimmer. PopGoblin's ShimmerLevel enum iterates
+             * Boost, Full, Low, Off and set_from_cc picks
+             * index = cc * 4 / 128, so the buckets are
+             * Boost 0-31, Full 32-63, Low 64-95, Off 96-127.
+             * Send bucket CENTRES, ordered off -> low -> full -> boost
+             * per the spec. The synth's default is Full, which is why
+             * init_step is 2: the puck starts in agreement without
+             * transmitting anything. */
+            .mode = BTN_MODE_CYCLE, .channel = 0, .cc = 105,
+            .steps = { 112, 80, 48, 16 }, .n_steps = 4, .init_step = 2,
         },
         { .mode = BTN_MODE_PRESET, .channel = 0, .preset_slot = 0 },
         { .mode = BTN_MODE_PRESET, .channel = 0, .preset_slot = 1 },
     },
-    /* Freeze (64) is deliberately absent: a scene should not re-trigger a
-     * live gesture. */
     .preset_capture     = { 102, 104, 107, 108, 105 },
     .preset_capture_len = 5,
 };
@@ -1402,7 +2027,7 @@ git commit -m "feat: profile table with the PopGoblin default surface"
 
 ---
 
-### Task 4.3: Wire the faders to the wire
+### Task 4.3: Wire the faders to the queue
 
 **Files:**
 - Modify: `firmware/src/main.c`
@@ -1432,7 +2057,6 @@ int main(void)
 
     for (;;) {
         board_io_feed_wdt();
-        uint32_t now = (uint32_t)k_uptime_get();
 
         if (board_io_function_held()) {
             held_ms += CONTROL_PERIOD_MS;
@@ -1445,8 +2069,9 @@ int main(void)
 
         for (int i = 0; i < PROFILE_NUM_FADERS; i++) {
             uint8_t v;
-            if (fader_update(&g_fader[i], board_io_read_fader(i), now, &v)) {
-                midi_tx_cc(prof->fader[i].channel, prof->fader[i].cc, v);
+            if (fader_update(&g_fader[i], board_io_read_fader(i), &v)) {
+                midi_tx_send((cc_msg_t){ prof->fader[i].channel,
+                                         prof->fader[i].cc, v });
             }
         }
 
@@ -1456,167 +2081,34 @@ int main(void)
 }
 ```
 
-Note on timing: all four faders are read every pass. The looper round-robins them because its ADC reads compete with an eMMC streamer; this firmware has no such competition, so four blocking reads per 5 ms pass are affordable. If the console shows the loop overrunning, fall back to round-robin and raise `FADER_MIN_INTERVAL_MS` to match.
+`midi_tx_send` pushes and returns, so a fader sweep never blocks this loop and never delays the watchdog. All four faders are read every pass: the looper round-robins them only because its ADC reads compete with an eMMC streamer, which this firmware does not have. If the console shows the loop overrunning, fall back to round-robin.
 
 - [ ] **Step 2: Build, flash, and test at the bench with the MIDI monitor**
 
-Expected: moving fader 1 produces CC 102 messages, fader 2 gives 104, fader 3 gives 107, fader 4 gives 108. An untouched fader produces nothing at all (this is the zipper test: any idle chatter means the deadband is too small for this unit, so raise `FADER_DEADBAND_RAW` and re-run the host tests).
+Expected, in order:
+1. Power on and touch nothing: **no MIDI at all**. This is the silent-boot rule and it is easy to get wrong.
+2. Move fader 1: CC 102 messages appear. Fader 2 gives 104, fader 3 gives 107, fader 4 gives 108.
+3. Stop moving: messages stop. Any idle chatter means the deadband is too small for this unit, so raise `FADER_DEADBAND_RAW` and re-run the host tests.
+4. Sweep all four at once, fast: the monitor should show a smooth interleaved stream rather than a backlog that keeps arriving after your hands stop.
 
 - [ ] **Step 3: Test at the rack**
 
-Expected: each fader moves its parameter on the popgoblin display, sweeps are smooth, and releasing a fader leaves the parameter exactly where the fader is (no lost final value, which is what the rate-limit retry protects).
+Expected: each fader moves its parameter on the popgoblin display, sweeps are smooth, and releasing a fader leaves the parameter exactly where the fader is.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add firmware/src/main.c
-git commit -m "feat: four faders drive their profile CCs on the synth"
+git commit -m "feat: four faders drive their profile CCs through the queue"
 ```
 
 ---
 
 # Phase 5: Buttons
 
-### Task 5.1: Button edge and hold detection, pure logic
+### Task 5.1: The unified button behaviour model, pure logic
 
-**Files:**
-- Modify: `firmware/src/controls.h`
-- Modify: `firmware/src/controls.c`
-- Modify: `tests/host/test_controls.c`
-
-**Interfaces:**
-- Produces:
-  - `uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms);` returning a bitmask of `BTN_EV_PRESS`, `BTN_EV_HOLD`, `BTN_EV_TAP`, `BTN_EV_RELEASE`.
-  - `uint32_t btn_held_ms(const btn_state_t *st, uint32_t now_ms);`
-
-- [ ] **Step 1: Add the failing tests to `tests/host/test_controls.c`**
-
-```c
-static void test_press_then_short_release_is_a_tap(void)
-{
-    btn_state_t st = {0};
-    CHECK_EQ(btn_update(&st, true,  0),   BTN_EV_PRESS);
-    CHECK_EQ(btn_update(&st, true,  50),  0);
-    CHECK_EQ(btn_update(&st, false, 120), BTN_EV_RELEASE | BTN_EV_TAP);
-}
-
-static void test_hold_fires_once_and_release_is_not_a_tap(void)
-{
-    btn_state_t st = {0};
-    CHECK_EQ(btn_update(&st, true, 0), BTN_EV_PRESS);
-    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS - 1), 0);
-    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS), BTN_EV_HOLD);
-    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS + 500), 0);   /* only once */
-    CHECK_EQ(btn_update(&st, false, BTN_HOLD_MS + 600), BTN_EV_RELEASE);
-}
-
-static void test_held_ms_measures_from_the_press(void)
-{
-    btn_state_t st = {0};
-    btn_update(&st, true, 1000);
-    CHECK_EQ(btn_held_ms(&st, 1350), 350);
-}
-
-static void test_idle_button_reports_nothing(void)
-{
-    btn_state_t st = {0};
-    CHECK_EQ(btn_update(&st, false, 0), 0);
-    CHECK_EQ(btn_update(&st, false, 5000), 0);
-}
-```
-Add the four `RUN(...)` lines to `main`.
-
-- [ ] **Step 2: Run and watch them fail**
-
-```bash
-make -C tests/host test
-```
-Expected: FAIL, `btn_update` not declared.
-
-- [ ] **Step 3: Extend `firmware/src/controls.h`**
-
-```c
-/* Hold threshold for "store this preset". Long enough that a performance
- * tap can never reach it. */
-#define BTN_HOLD_MS        2000
-
-/* Above this, a press is treated as a pedal gesture rather than a tap. */
-#define BTN_MOMENTARY_MS   300
-
-#define BTN_EV_PRESS    0x01u
-#define BTN_EV_HOLD     0x02u
-#define BTN_EV_TAP      0x04u
-#define BTN_EV_RELEASE  0x08u
-
-typedef struct {
-    bool     down;
-    bool     hold_fired;
-    uint32_t down_at_ms;
-} btn_state_t;
-
-/* Feed the debounced pressed/released state once per control pass. */
-uint8_t  btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms);
-uint32_t btn_held_ms(const btn_state_t *st, uint32_t now_ms);
-```
-
-- [ ] **Step 4: Extend `firmware/src/controls.c`**
-
-```c
-uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms)
-{
-    uint8_t ev = 0;
-
-    if (pressed_now && !st->down) {
-        st->down       = true;
-        st->hold_fired = false;
-        st->down_at_ms = now_ms;
-        return BTN_EV_PRESS;
-    }
-
-    if (pressed_now && st->down) {
-        if (!st->hold_fired &&
-            (uint32_t)(now_ms - st->down_at_ms) >= BTN_HOLD_MS) {
-            st->hold_fired = true;
-            ev |= BTN_EV_HOLD;
-        }
-        return ev;
-    }
-
-    if (!pressed_now && st->down) {
-        st->down = false;
-        ev = BTN_EV_RELEASE;
-        if (!st->hold_fired) {
-            ev |= BTN_EV_TAP;
-        }
-        return ev;
-    }
-
-    return 0;
-}
-
-uint32_t btn_held_ms(const btn_state_t *st, uint32_t now_ms)
-{
-    return st->down ? (uint32_t)(now_ms - st->down_at_ms) : 0u;
-}
-```
-
-- [ ] **Step 5: Run the tests**
-
-```bash
-make -C tests/host test
-```
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add firmware/src/controls.c firmware/src/controls.h tests/host/test_controls.c
-git commit -m "feat: button press, hold, tap and release detection"
-```
-
----
-
-### Task 5.2: The unified button behaviour model, pure logic
+`btn_update` already exists from Task 4.1. This task adds the layer above it.
 
 **Files:**
 - Create: `firmware/src/buttons.h`
@@ -1627,10 +2119,15 @@ git commit -m "feat: button press, hold, tap and release detection"
 **Interfaces:**
 - Produces:
   - `void button_engine_init(button_engine_t *e, const profile_t *prof);`
-  - `int  button_engine_event(button_engine_t *e, int idx, uint8_t ev, uint32_t held_ms, cc_msg_t *out, int out_max);` returning the number of messages to send, or a negative value for "the caller must handle a preset action" (see below).
-  - `typedef struct { uint8_t channel, cc, value; } cc_msg_t;`
+  - `int  button_engine_event(button_engine_t *e, int idx, uint8_t ev, uint32_t held_ms, uint32_t now_ms, cc_msg_t *out, int out_max);`
+  - `int  button_engine_tick(button_engine_t *e, uint32_t now_ms, cc_msg_t *out, int out_max);`
+  - `int  button_engine_pending_save_slot(const button_engine_t *e);`
+  - `void button_engine_set_preset(button_engine_t *e, int slot, const cc_msg_t *msgs, int len);`
+  - `const preset_slot_t *button_engine_get_preset(const button_engine_t *e, int slot);`
+  - `uint8_t button_engine_step_index(const button_engine_t *e, int idx);`
+  - `bool button_engine_is_latched(const button_engine_t *e, int idx);`
 
-Everything a button does is "emit a list of (channel, cc, value)". The engine never talks to hardware and never sleeps: the caller sends the list with the 1 to 2 ms spacing.
+Everything a button does is "emit a list of (channel, cc, value)". The engine never talks to hardware and never sleeps: the caller queues the list.
 
 - [ ] **Step 1: Write the failing test, `tests/host/test_buttons.c`**
 
@@ -1649,12 +2146,10 @@ static void setup(void)
     button_engine_init(&eng, &profile_popgoblin_default);
 }
 
-/* --- freeze: tap latches, second tap releases --- */
-
 static void test_freeze_press_sends_on(void)
 {
     setup();
-    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, 0, out, OUT_MAX);
+    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
     CHECK_EQ(n, 1);
     CHECK_EQ(out[0].cc, 64);
     CHECK_EQ(out[0].value, 127);
@@ -1663,9 +2158,8 @@ static void test_freeze_press_sends_on(void)
 static void test_freeze_tap_latches_on_release(void)
 {
     setup();
-    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, out, OUT_MAX);
-    /* short press: nothing is sent on release, the freeze stays on */
-    int n = button_engine_event(&eng, 0, BTN_EV_RELEASE | BTN_EV_TAP, 120,
+    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
+    int n = button_engine_event(&eng, 0, BTN_EV_RELEASE | BTN_EV_TAP, 120, 0,
                                 out, OUT_MAX);
     CHECK_EQ(n, 0);
 }
@@ -1673,9 +2167,9 @@ static void test_freeze_tap_latches_on_release(void)
 static void test_freeze_second_tap_sends_off(void)
 {
     setup();
-    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, out, OUT_MAX);
-    button_engine_event(&eng, 0, BTN_EV_RELEASE | BTN_EV_TAP, 120, out, OUT_MAX);
-    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, 0, out, OUT_MAX);
+    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
+    button_engine_event(&eng, 0, BTN_EV_RELEASE | BTN_EV_TAP, 120, 0, out, OUT_MAX);
+    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
     CHECK_EQ(n, 1);
     CHECK_EQ(out[0].cc, 64);
     CHECK_EQ(out[0].value, 0);
@@ -1684,36 +2178,67 @@ static void test_freeze_second_tap_sends_off(void)
 static void test_freeze_long_press_is_momentary(void)
 {
     setup();
-    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, out, OUT_MAX);
-    /* held past the momentary threshold: release sends off */
-    int n = button_engine_event(&eng, 0, BTN_EV_RELEASE, 900, out, OUT_MAX);
+    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
+    int n = button_engine_event(&eng, 0, BTN_EV_RELEASE, 900, 0, out, OUT_MAX);
     CHECK_EQ(n, 1);
     CHECK_EQ(out[0].cc, 64);
     CHECK_EQ(out[0].value, 0);
 }
 
-/* --- shimmer: each tap steps --- */
-
 static void test_shimmer_steps_and_wraps(void)
 {
     setup();
-    const uint8_t want[5] = { 42, 85, 127, 0, 42 };
+    const uint8_t want[5] = { 16, 112, 80, 48, 16 };
     for (int i = 0; i < 5; i++) {
-        int n = button_engine_event(&eng, 1, BTN_EV_RELEASE | BTN_EV_TAP, 100,
-                                    out, OUT_MAX);
+        int n = button_engine_event(&eng, 1, BTN_EV_RELEASE | BTN_EV_TAP, 100, 0,
+                                out, OUT_MAX);
         CHECK_EQ(n, 1);
         CHECK_EQ(out[0].cc, 105);
         CHECK_EQ(out[0].value, want[i]);
     }
 }
 
+/* PopGoblin boots with shimmer at Full. The puck must start on that same
+ * step so its first tap is a real change and its LED does not lie, and it
+ * must reach that agreement WITHOUT transmitting. */
+static void test_cycle_starts_on_the_synths_default_step(void)
+{
+    setup();
+    CHECK_EQ(button_engine_step_index(&eng, 1), 2);
+}
+
+/* A release that never arrives (a flaky ladder read, a crash mid-press)
+ * would otherwise leave freeze on for the rest of the session. */
+static void test_pedal_timeout_force_releases_freeze(void)
+{
+    setup();
+    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 1000, out, OUT_MAX);
+
+    /* Nothing happens while the timeout has not expired. */
+    CHECK_EQ(button_engine_tick(&eng, 1000 + BTN_PEDAL_MAX_MS - 1,
+                                out, OUT_MAX), 0);
+
+    int n = button_engine_tick(&eng, 1000 + BTN_PEDAL_MAX_MS, out, OUT_MAX);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(out[0].cc, 64);
+    CHECK_EQ(out[0].value, 0);
+
+    /* And only once. */
+    CHECK_EQ(button_engine_tick(&eng, 1000 + BTN_PEDAL_MAX_MS + 5000,
+                                out, OUT_MAX), 0);
+}
+
+static void test_tick_is_silent_when_no_pedal_is_down(void)
+{
+    setup();
+    CHECK_EQ(button_engine_tick(&eng, 999999, out, OUT_MAX), 0);
+}
+
 static void test_shimmer_press_alone_sends_nothing(void)
 {
     setup();
-    CHECK_EQ(button_engine_event(&eng, 1, BTN_EV_PRESS, 0, out, OUT_MAX), 0);
+    CHECK_EQ(button_engine_event(&eng, 1, BTN_EV_PRESS, 0, 0, out, OUT_MAX), 0);
 }
-
-/* --- presets --- */
 
 static void test_preset_tap_replays_the_stored_list(void)
 {
@@ -1722,7 +2247,7 @@ static void test_preset_tap_replays_the_stored_list(void)
         { 0, 102, 30 }, { 0, 104, 90 }, { 0, 107, 12 },
     };
     button_engine_set_preset(&eng, 0, scene, 3);
-    int n = button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP, 100,
+    int n = button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP, 100, 0,
                                 out, OUT_MAX);
     CHECK_EQ(n, 3);
     CHECK_EQ(out[0].cc, 102);
@@ -1734,14 +2259,14 @@ static void test_preset_tap_replays_the_stored_list(void)
 static void test_empty_preset_sends_nothing(void)
 {
     setup();
-    CHECK_EQ(button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP, 100,
-                                 out, OUT_MAX), 0);
+    CHECK_EQ(button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP, 100, 0,
+                                out, OUT_MAX), 0);
 }
 
 static void test_preset_hold_requests_a_save(void)
 {
     setup();
-    int n = button_engine_event(&eng, 3, BTN_EV_HOLD, BTN_HOLD_MS,
+    int n = button_engine_event(&eng, 3, BTN_EV_HOLD, BTN_HOLD_MS, 0,
                                 out, OUT_MAX);
     CHECK_EQ(n, BUTTON_ACTION_SAVE_PRESET);
     CHECK_EQ(button_engine_pending_save_slot(&eng), 1);
@@ -1750,9 +2275,9 @@ static void test_preset_hold_requests_a_save(void)
 static void test_release_after_a_save_does_not_also_replay(void)
 {
     setup();
-    button_engine_event(&eng, 3, BTN_EV_HOLD, BTN_HOLD_MS, out, OUT_MAX);
-    CHECK_EQ(button_engine_event(&eng, 3, BTN_EV_RELEASE, BTN_HOLD_MS + 100,
-                                 out, OUT_MAX), 0);
+    button_engine_event(&eng, 3, BTN_EV_HOLD, BTN_HOLD_MS, 0, out, OUT_MAX);
+    CHECK_EQ(button_engine_event(&eng, 3, BTN_EV_RELEASE, BTN_HOLD_MS + 100, 0,
+                                out, OUT_MAX), 0);
 }
 
 int main(void)
@@ -1763,6 +2288,9 @@ int main(void)
     RUN(test_freeze_long_press_is_momentary);
     RUN(test_shimmer_steps_and_wraps);
     RUN(test_shimmer_press_alone_sends_nothing);
+    RUN(test_cycle_starts_on_the_synths_default_step);
+    RUN(test_pedal_timeout_force_releases_freeze);
+    RUN(test_tick_is_silent_when_no_pedal_is_down);
     RUN(test_preset_tap_replays_the_stored_list);
     RUN(test_empty_preset_sends_nothing);
     RUN(test_preset_hold_requests_a_save);
@@ -1774,7 +2302,7 @@ int main(void)
 - [ ] **Step 2: Run and watch it fail**
 
 ```bash
-sed -i '' 's/^TESTS := smoke controls profile/TESTS := smoke controls profile buttons/' tests/host/Makefile
+sed -i '' 's/^TESTS := smoke txqueue controls profile/TESTS := smoke txqueue controls profile buttons/' tests/host/Makefile
 make -C tests/host test
 ```
 Expected: FAIL, `buttons.h` not found.
@@ -1785,7 +2313,8 @@ Expected: FAIL, `buttons.h` not found.
 /* PURE. The unified button model: every button is "send a list of
  * (channel, cc, value)". Freeze is a one-item toggling list, shimmer is a
  * one-item cycling list, a preset is a short list replayed on the CCs the
- * faders already drive. No new CCs, and therefore no synth-side work. */
+ * faders already drive, and BTN_MODE_LIST is an arbitrary configured list.
+ * No new CCs, and therefore no synth-side work. */
 #ifndef SP1_BUTTONS_H
 #define SP1_BUTTONS_H
 
@@ -1796,14 +2325,12 @@ Expected: FAIL, `buttons.h` not found.
 
 #define BUTTON_MAX_PRESET_SLOTS 2
 
-/* Returned by button_engine_event instead of a message count. */
 #define BUTTON_ACTION_SAVE_PRESET (-1)
 
-typedef struct {
-    uint8_t channel;
-    uint8_t cc;
-    uint8_t value;
-} cc_msg_t;
+/* A pedal press held longer than this is treated as a lost release and
+ * force-released, so a missed RELEASE can never leave freeze stuck on for
+ * the rest of a session. Far longer than any real pedal gesture. */
+#define BTN_PEDAL_MAX_MS 20000u
 
 typedef struct {
     cc_msg_t msg[PROFILE_MAX_CAPTURE];
@@ -1812,29 +2339,32 @@ typedef struct {
 
 typedef struct {
     const profile_t *prof;
-    bool     latched[PROFILE_NUM_BUTTONS];    /* LATCH_MOMENTARY state */
+    bool     latched[PROFILE_NUM_BUTTONS];
     bool     pending_pedal[PROFILE_NUM_BUTTONS];
-    uint8_t  step_idx[PROFILE_NUM_BUTTONS];   /* STEP position */
-    bool     save_armed[PROFILE_NUM_BUTTONS]; /* a hold consumed the release */
+    uint8_t  step_idx[PROFILE_NUM_BUTTONS];
+    bool     save_armed[PROFILE_NUM_BUTTONS];
+    uint32_t pedal_started_ms[PROFILE_NUM_BUTTONS];
     int      pending_save_slot;
     preset_slot_t preset[BUTTON_MAX_PRESET_SLOTS];
 } button_engine_t;
 
 void button_engine_init(button_engine_t *e, const profile_t *prof);
 
-/* Feed one button event mask from btn_update. Returns the number of
- * messages written to out, 0 for nothing to send, or
- * BUTTON_ACTION_SAVE_PRESET when the caller must snapshot the surface into
- * button_engine_pending_save_slot(e) and then call button_engine_set_preset. */
 int  button_engine_event(button_engine_t *e, int idx, uint8_t ev,
-                         uint32_t held_ms, cc_msg_t *out, int out_max);
+                         uint32_t held_ms, uint32_t now_ms,
+                         cc_msg_t *out, int out_max);
+
+/* Call once per control pass. Returns messages that must be sent because
+ * of the passage of time alone: today, force-releasing a pedal whose
+ * RELEASE never arrived. */
+int  button_engine_tick(button_engine_t *e, uint32_t now_ms,
+                        cc_msg_t *out, int out_max);
 
 int  button_engine_pending_save_slot(const button_engine_t *e);
 void button_engine_set_preset(button_engine_t *e, int slot,
                               const cc_msg_t *msgs, int len);
 const preset_slot_t *button_engine_get_preset(const button_engine_t *e, int slot);
 
-/* For the LED layer: current step index and latch state. */
 uint8_t button_engine_step_index(const button_engine_t *e, int idx);
 bool    button_engine_is_latched(const button_engine_t *e, int idx);
 
@@ -1852,6 +2382,22 @@ void button_engine_init(button_engine_t *e, const profile_t *prof)
     memset(e, 0, sizeof(*e));
     e->prof = prof;
     e->pending_save_slot = -1;
+
+    for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
+        const button_cfg_t *cfg = &prof->button[i];
+        /* Start a cycle button where the synth actually is, so the puck
+         * agrees with it at power-on without transmitting. */
+        if (cfg->mode == BTN_MODE_CYCLE && cfg->n_steps) {
+            e->step_idx[i] = (uint8_t)(cfg->init_step % cfg->n_steps);
+        }
+        /* Factory-default preset content, overwritten later by whatever
+         * flash holds. */
+        if (cfg->mode == BTN_MODE_PRESET && cfg->n_list) {
+            button_engine_set_preset(e, cfg->preset_slot, cfg->list,
+                                     cfg->n_list);
+        }
+    }
+    e->pending_save_slot = -1;
 }
 
 static int emit(cc_msg_t *out, int out_max, int n,
@@ -1867,8 +2413,11 @@ static int emit(cc_msg_t *out, int out_max, int n,
 }
 
 int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
-                        uint32_t held_ms, cc_msg_t *out, int out_max)
+                        uint32_t held_ms, uint32_t now_ms,
+                        cc_msg_t *out, int out_max)
 {
+    const uint32_t held_ms_now = now_ms;
+
     if (idx < 0 || idx >= PROFILE_NUM_BUTTONS) {
         return 0;
     }
@@ -1877,10 +2426,7 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
 
     switch (cfg->mode) {
 
-    case BTN_MODE_LATCH_MOMENTARY:
-        /* Press acts immediately: a performer expects freeze the instant
-         * the finger lands. What the RELEASE means depends on how long the
-         * press lasted, which is the whole trick. */
+    case BTN_MODE_TOGGLE:
         if (ev & BTN_EV_PRESS) {
             if (e->latched[idx]) {
                 e->latched[idx]       = false;
@@ -1888,7 +2434,8 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
                 return emit(out, out_max, n, cfg->channel, cfg->cc,
                             cfg->off_value);
             }
-            e->pending_pedal[idx] = true;
+            e->pending_pedal[idx]    = true;
+            e->pedal_started_ms[idx] = held_ms_now;
             return emit(out, out_max, n, cfg->channel, cfg->cc, cfg->on_value);
         }
         if (ev & BTN_EV_RELEASE) {
@@ -1897,16 +2444,16 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
             }
             e->pending_pedal[idx] = false;
             if (held_ms >= BTN_MOMENTARY_MS) {
-                e->latched[idx] = false;     /* it was a pedal */
+                e->latched[idx] = false;
                 return emit(out, out_max, n, cfg->channel, cfg->cc,
                             cfg->off_value);
             }
-            e->latched[idx] = true;          /* it was a tap: stay on */
+            e->latched[idx] = true;
             return 0;
         }
         return 0;
 
-    case BTN_MODE_STEP:
+    case BTN_MODE_CYCLE:
         if (ev & BTN_EV_TAP) {
             if (cfg->n_steps == 0) {
                 return 0;
@@ -1914,6 +2461,16 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
             e->step_idx[idx] = (uint8_t)((e->step_idx[idx] + 1) % cfg->n_steps);
             return emit(out, out_max, n, cfg->channel, cfg->cc,
                         cfg->steps[e->step_idx[idx]]);
+        }
+        return 0;
+
+    case BTN_MODE_LIST:
+        if (ev & BTN_EV_TAP) {
+            for (int i = 0; i < cfg->n_list; i++) {
+                n = emit(out, out_max, n, cfg->list[i].channel,
+                         cfg->list[i].cc, cfg->list[i].value);
+            }
+            return n;
         }
         return 0;
 
@@ -1925,7 +2482,7 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
         }
         if (ev & BTN_EV_RELEASE) {
             if (e->save_armed[idx]) {
-                e->save_armed[idx] = false;  /* the hold already acted */
+                e->save_armed[idx] = false;
                 return 0;
             }
             if (!(ev & BTN_EV_TAP)) {
@@ -1947,6 +2504,27 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
     return 0;
 }
 
+int button_engine_tick(button_engine_t *e, uint32_t now_ms,
+                       cc_msg_t *out, int out_max)
+{
+    int n = 0;
+    for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
+        if (!e->pending_pedal[i]) {
+            continue;
+        }
+        if ((uint32_t)(now_ms - e->pedal_started_ms[i]) < BTN_PEDAL_MAX_MS) {
+            continue;
+        }
+        /* The release never arrived. Let go on the performer's behalf:
+         * a stuck freeze ruins the rest of the session. */
+        const button_cfg_t *cfg = &e->prof->button[i];
+        e->pending_pedal[i] = false;
+        e->latched[i]       = false;
+        n = emit(out, out_max, n, cfg->channel, cfg->cc, cfg->off_value);
+    }
+    return n;
+}
+
 int button_engine_pending_save_slot(const button_engine_t *e)
 {
     return e->pending_save_slot;
@@ -1957,6 +2535,9 @@ void button_engine_set_preset(button_engine_t *e, int slot,
 {
     if (slot < 0 || slot >= BUTTON_MAX_PRESET_SLOTS) {
         return;
+    }
+    if (len < 0) {
+        return;                 /* a negative length would make memcpy enormous */
     }
     if (len > PROFILE_MAX_CAPTURE) {
         len = PROFILE_MAX_CAPTURE;
@@ -1990,18 +2571,18 @@ bool button_engine_is_latched(const button_engine_t *e, int idx)
 ```bash
 make -C tests/host test
 ```
-Expected: PASS for all four suites.
+Expected: PASS for all five suites.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add firmware/src/buttons.c firmware/src/buttons.h tests/host
-git commit -m "feat: unified button model, freeze latch/pedal, step and preset"
+git commit -m "feat: unified button model, freeze latch/pedal, cycle and preset"
 ```
 
 ---
 
-### Task 5.3: Wire the buttons, with debounce and burst pacing
+### Task 5.2: Wire the buttons, with debounce
 
 **Files:**
 - Modify: `firmware/src/main.c`
@@ -2016,10 +2597,19 @@ The track buttons sit on one noisy resistor ladder, so a single raw read at a ba
 static int debounced_track_button(void)
 {
     static int committed = -1, candidate = -1, count;
+    static int err_run;
     int raw = board_io_read_track_ladder();
     if (raw < 0) {
-        return committed;               /* ADC error: hold */
+        /* REVIEW: holding the committed value forever on ADC failure is how
+         * a pressed button becomes a stuck pedal. Tolerate a few bad reads,
+         * then report "nothing pressed" and let the release happen. */
+        if (++err_run < 10) {
+            return committed;
+        }
+        committed = -1;
+        return committed;
     }
+    err_run = 0;
     int b = board_io_decode_track_button(raw);
     if (b == committed) {
         count = 0;
@@ -2032,29 +2622,13 @@ static int debounced_track_button(void)
 }
 ```
 
-- [ ] **Step 2: Add the send helper with burst spacing**
+- [ ] **Step 2: Feed the engine from the control loop**
+
+Add `#include "buttons.h"` to `main.c`, declare the engine next to `g_fader`, and initialise it before the loop:
 
 ```c
-/* A CC is 3 bytes, about 1 ms on the wire at 31250 baud. Spacing messages
- * by 2 ms keeps a preset burst gentle on the synth's MIDI FIFO. */
-static void send_msgs(const cc_msg_t *msgs, int n)
-{
-    for (int i = 0; i < n; i++) {
-        midi_tx_cc(msgs[i].channel, msgs[i].cc, msgs[i].value);
-        if (i + 1 < n) {
-            k_msleep(2);
-        }
-    }
-}
-```
-
-- [ ] **Step 3: Feed the engine from the control loop**
-
-Add `#include "buttons.h"` to `main.c`, declare the engine next to `g_fader`, and initialise it in `main` before the loop:
-
-```c
-static button_engine_t     eng;
-static btn_state_t         g_btn[PROFILE_NUM_BUTTONS];
+static button_engine_t eng;
+static btn_state_t     g_btn[PROFILE_NUM_BUTTONS];
 ```
 
 ```c
@@ -2064,40 +2638,54 @@ static btn_state_t         g_btn[PROFILE_NUM_BUTTONS];
 Then, inside the loop after the fader block:
 
 ```c
-        int pressed = debounced_track_button();   /* -1, 0..3, or 4 for play */
+        uint32_t now     = (uint32_t)k_uptime_get();
+        int      pressed = debounced_track_button();  /* -1, 0..3, 4 = play */
+        cc_msg_t msgs[PROFILE_MAX_CAPTURE];
 
         for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
-            uint8_t ev = btn_update(&g_btn[i], pressed == i, now);
+            uint32_t held;
+            uint8_t  ev = btn_update(&g_btn[i], pressed == i, now, &held);
             if (!ev) {
                 continue;
             }
-            cc_msg_t msgs[PROFILE_MAX_CAPTURE];
-            int n = button_engine_event(&eng, i, ev, btn_held_ms(&g_btn[i], now),
+            int n = button_engine_event(&eng, i, ev, held, now,
                                         msgs, (int)(sizeof(msgs) / sizeof(msgs[0])));
             if (n == BUTTON_ACTION_SAVE_PRESET) {
                 /* TODO(Phase 7): snapshot the surface and persist it. */
                 continue;
             }
-            if (n > 0) {
-                send_msgs(msgs, n);
+            for (int k = 0; k < n; k++) {
+                midi_tx_send(msgs[k]);
             }
+        }
+
+        /* Time-driven events: today, force-releasing a pedal whose RELEASE
+         * never arrived. Cheap, and it is the only thing standing between a
+         * dropped release and a freeze that stays on all night. */
+        int tn = button_engine_tick(&eng, now, msgs,
+                                    (int)(sizeof(msgs) / sizeof(msgs[0])));
+        for (int k = 0; k < tn; k++) {
+            midi_tx_send(msgs[k]);
         }
 ```
 
-Note that `send_msgs` sleeps between messages of a burst, which stretches that control pass. With at most five messages that is 8 ms of extra latency on a preset recall only, well inside the 4 s watchdog, and no fader is being swept at the moment a preset button is tapped. If that ever becomes a problem, move sending to a work queue rather than shortening the spacing.
+REVIEW, and this is the bug that would have shipped: `held` comes from `btn_update` as an out-parameter, not from a second call afterwards. The release clears the press timer, so asking for the duration after the update always returned zero, the `held >= BTN_MOMENTARY_MS` branch was unreachable, and a long hold on freeze would have *latched* it instead of releasing it. The unit tests passed anyway because they called the engine with an explicit duration and never exercised this ordering. `test_release_reports_the_real_press_duration` now pins it.
 
-Note: only one ladder button can be read at a time by construction, so simultaneous presses are not supported. That matches the spec's surface, which has no chords.
+Queuing the whole burst at once is deliberate: the drain thread paces it on the wire, so the control loop stays at 5 ms even during a preset recall. This is the reason the queue exists.
 
-- [ ] **Step 4: Build, flash, and test at the rack**
+Only one ladder button can be read at a time by construction, so simultaneous presses are not supported. That matches the spec's surface, which has no chords.
+
+- [ ] **Step 3: Build, flash, and test at the rack**
 
 Expected, in this order:
 1. Tap track 1: freeze engages and stays on. Tap again: it releases.
 2. Press and hold track 1 for a second: freeze engages, and releases the moment the finger lifts.
-3. Tap track 2 four times: shimmer steps through its four states and returns to the start.
-4. Tap track 3 or 4: nothing yet (no preset stored).
-5. No stuck freeze, ever. If a release is ever missed, freeze stays on and the session is ruined, so test this one hard, including fast repeated taps.
+3. The boundary case: a press of roughly 400 ms. Either behaviour is acceptable there, but it must be one or the other, never both.
+4. Tap track 2 four times: shimmer steps through its four states and returns to the start.
+5. Tap track 3 or 4: nothing yet (no preset stored).
+6. No stuck freeze, ever. If a release is ever missed, freeze stays on and the session is ruined, so test this hard, including fast repeated taps and pressing two buttons at once.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add firmware/src/main.c
@@ -2112,11 +2700,11 @@ git commit -m "feat: track buttons drive freeze and shimmer on the synth"
 
 **Files:**
 - Modify: `firmware/src/main.c`
-- Modify: `firmware/src/board_io.c` (only if Task 2.3 found brightness control is unavailable)
+- Modify: `firmware/src/board_io.c` (only if Task 2.3 found brightness unavailable)
+
+An honest framing, per the revised spec: these LEDs show the **puck's own state**, which equals the synth's state only while the takeover policy holds. MIDI here is one-way and there is no readback, so nothing on this panel can prove the other end is listening.
 
 - [ ] **Step 1: Mirror fader values on the centre row**
-
-After the fader loop, render each fader's last-sent value as brightness. The puck then doubles as a readout of the four macro states, which is what the spec asked for, rendered on the LEDs that actually exist.
 
 ```c
         for (int i = 0; i < PROFILE_NUM_FADERS; i++) {
@@ -2127,14 +2715,16 @@ After the fader loop, render each fader's last-sent value as brightness. The puc
         }
 ```
 
-If Task 2.3 established that the LEDs are on/off only, render instead as: LED lit when the value is above 64, plus a short blink on every change. Write down which rendering you implemented and why in `docs/hardware-notes.md`.
+If Task 2.3 established that the LEDs are on/off only, render instead as lit above 64 plus a short blink on change, and record which rendering you implemented in `docs/hardware-notes.md`.
 
-- [ ] **Step 2: Mirror button state on the track row**
+- [ ] **Step 2: Show pickup state**
+
+A fader in soft pickup is not in control yet, and the performer needs to know which way to move. Blink that fader's LED while `fader_pickup_armed(&g_fader[i])` is true, rather than showing a steady level. It stops blinking the instant the fader catches its value, which is also the confirmation that it took over.
+
+- [ ] **Step 3: Mirror button state on the track row**
 
 ```c
         board_io_track_led_set(0, button_engine_is_latched(&eng, 0));
-        /* Shimmer: the step index shown as one of four brightness levels,
-         * so step 0 reads dark and the top step reads full. */
         board_io_track_led_set(1, button_engine_step_index(&eng, 1) != 0);
         for (int b = 2; b < PROFILE_NUM_BUTTONS; b++) {
             const preset_slot_t *p =
@@ -2143,26 +2733,74 @@ If Task 2.3 established that the LEDs are on/off only, render instead as: LED li
         }
 ```
 
-The track row is on/off in the lifted renderer, so shimmer shows only "not off" here. If Task 2.3 found that the track LEDs also accept brightness, use `board_io_led_set`-style levels for shimmer instead and say so in the notes.
+REVIEW: `board_io_track_led_set` is boolean, so as written this shows only "shimmer is not off", and the four-level reading described in an earlier draft of Task 2.3 is not achievable through this API. Either accept the boolean reading (fine for v1) or, if Task 2.3 found the track LEDs accept soft-PWM, widen the API to take a level and render four brightnesses. Decide from the survey and record which you did. Do not leave the hardware expectation and the API disagreeing.
 
-- [ ] **Step 3: Add the link heartbeat**
+- [ ] **Step 4: Local activity indicator, not a link heartbeat**
 
-The spec asks for a play-button LED heartbeat. There is no separate play LED in the verified map, so use centre LED 3 if Task 2.3 found it unused by the fader readout, otherwise a brief brightness dip on the relevant fader LED at each transmission. Keep it subtle: this is confirmation, not decoration. Record the choice.
+Blink one LED briefly on each transmission. Call it what it is in the code comment: a local TX indicator. It proves the puck sent something, not that anything received it.
 
-- [ ] **Step 4: Verify on hardware**
+- [ ] **Step 5: Verify on hardware**
 
-Expected: moving a fader visibly changes its LED; freeze shows as a lit track LED and clears when released; shimmer brightness steps with each tap. Nothing flickers when the puck is left alone (a flickering idle LED means the fader deadband is letting jitter through and Phase 4's constant needs raising).
+Expected: moving a fader visibly changes its LED; freeze shows as a lit track LED and clears when released; shimmer brightness or state steps with each tap; a fader in pickup blinks until it catches. Nothing flickers when the puck is left alone: a flickering idle LED means the fader deadband is letting jitter through and Task 2.2's measurement needs revisiting.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add firmware/src docs/hardware-notes.md
-git commit -m "feat: LED readout for fader values and button state"
+git commit -m "feat: LED readout for fader values, pickup state and buttons"
 ```
 
 ---
 
 # Phase 7: Presets
+
+### Task 7.0: Prove the storage page is ours before writing to it
+
+REVIEW raised this as a device-recovery hazard, and it is the right call. Both reference board files *label* `0xFF000` as `storage`, but neither demonstrates that the TE bootloader ignores it. If the bootloader keeps settings, image-validation state or recovery metadata there, `flash_area_erase` on that page is a plausible soft-brick on scarce hardware. A label in a devicetree written by the community is a hypothesis, not a fact.
+
+**Files:**
+- Modify: `firmware/src/main.c` (temporary diagnostic, reverted at the end)
+- Modify: `docs/hardware-notes.md`
+
+- [ ] **Step 1: Dump the page, read only**
+
+Behind `SP1_DIAG`, print the full 4 KB at `0xFF000` as hex over the console, once at boot. Read only: no erase, no write.
+
+```c
+        const struct flash_area *fa;
+        if (flash_area_open(FIXED_PARTITION_ID(storage_partition), &fa) == 0) {
+            static uint8_t page[4096];
+            if (flash_area_read(fa, 0, page, sizeof(page)) == 0) {
+                for (int i = 0; i < 4096; i += 16) {
+                    printk("%04x:", i);
+                    for (int j = 0; j < 16; j++) printk(" %02x", page[i + j]);
+                    printk("\n");
+                }
+            }
+            flash_area_close(fa);
+        }
+```
+
+- [ ] **Step 2: Interpret what came back**
+
+- **All `0xFF`:** the page has never been written. It is almost certainly free, and nothing we do can destroy state that is not there. Proceed, and note that the first erase will not happen until 102 saves in.
+- **Structured non-`0xFF` content:** something owns this page. **Stop.** Do not write. Record the dump in `docs/hardware-notes.md` and re-plan: the fallback is to keep presets in RAM only for v1 (they survive a power cycle only if the puck stays charged, which the session test can still evaluate) and to ask on the Discord what lives there.
+- **A few scattered non-`0xFF` bytes:** ambiguous. Treat as owned until proved otherwise.
+
+- [ ] **Step 3: Confirm the flasher really does stop below it**
+
+Note the current dump, reflash the firmware via the utility, dump again. If the content is unchanged, the claim from `protocol.js:10-11` (that writing stops at `0xFF000`) is confirmed on real hardware rather than read off a constant.
+
+- [ ] **Step 4: Record the verdict and commit**
+
+```bash
+git add docs/hardware-notes.md firmware/src/main.c
+git commit -m "docs: storage page at 0xFF000 dumped and proved free before use"
+```
+
+**STOP RULE:** Phase 7 does not proceed to writing until this task says the page is free.
+
+---
 
 ### Task 7.1: Preset record format, pure logic
 
@@ -2293,7 +2931,7 @@ int main(void)
 - [ ] **Step 2: Run and watch it fail**
 
 ```bash
-sed -i '' 's/^TESTS := smoke controls profile buttons/TESTS := smoke controls profile buttons presets/' tests/host/Makefile
+sed -i '' 's/^TESTS := smoke txqueue controls profile buttons/TESTS := smoke txqueue controls profile buttons presets/' tests/host/Makefile
 make -C tests/host test
 ```
 Expected: FAIL, `presets.h` not found.
@@ -2332,12 +2970,12 @@ typedef struct {
  *   [20]     slot 1 length
  *   [21..35] slot 1, up to 5 entries
  *   [36..38] reserved (0)
- *   [39]     CRC-8 over bytes 0 to 38
- * Five entries per slot matches the default profile's five-CC capture
- * list exactly. If PROFILE_MAX_CAPTURE ever grows past 5, grow
- * PRESET_ENTRIES and PRESET_REC_SIZE together: silently truncating a
- * scene is worse than refusing to build. */
+ *   [39]     CRC-8 over bytes 0 to 38 */
 #define PRESET_ENTRIES 5
+
+#if PROFILE_MAX_CAPTURE > PRESET_ENTRIES
+#error "preset records cannot hold the profile's capture list"
+#endif
 
 void preset_record_encode(const preset_bank_t *bank, uint8_t rec[PRESET_REC_SIZE]);
 bool preset_record_decode(const uint8_t rec[PRESET_REC_SIZE], preset_bank_t *out);
@@ -2352,15 +2990,7 @@ int  preset_page_next_offset(const uint8_t *page, uint32_t page_len);
 #endif /* SP1_PRESETS_H */
 ```
 
-Add a compile-time guard directly under the defines so the two can never drift:
-
-```c
-#if PROFILE_MAX_CAPTURE > PRESET_ENTRIES
-#error "preset records cannot hold the profile's capture list"
-#endif
-```
-
-Both are 5 today, so the guard is silent. It exists so that a future profile with a longer capture list fails the build instead of quietly losing the tail of a scene.
+Both constants are 5 today, so the guard is silent. It exists so that a future profile with a longer capture list fails the build instead of quietly losing the tail of a scene.
 
 - [ ] **Step 4: Write `firmware/src/presets.c`**
 
@@ -2473,7 +3103,7 @@ int preset_page_next_offset(const uint8_t *page, uint32_t page_len)
 ```bash
 make -C tests/host test
 ```
-Expected: PASS for all five suites.
+Expected: PASS for all six suites.
 
 - [ ] **Step 6: Commit**
 
@@ -2484,22 +3114,22 @@ git commit -m "feat: preset record format with CRC and single-page append-log"
 
 ---
 
-### Task 7.2: Flash storage and the save gesture
+### Task 7.2: Flash storage, the save gesture, and pickup on recall
 
 **Files:**
 - Create: `firmware/src/presets_flash.c`
-- Modify: `firmware/src/presets.h` (add the three IO prototypes)
+- Modify: `firmware/src/presets.h` (add the two IO prototypes)
 - Modify: `firmware/src/main.c`
 
 **Interfaces:**
 - Produces:
   - `bool preset_store_load(preset_bank_t *out);`
   - `bool preset_store_save(const preset_bank_t *bank);`
-  - These are the only functions in the preset path that touch Zephyr, so they are excluded from `SRC_presets` in the host Makefile.
+  - These are the only functions in the preset path that touch Zephyr, so `presets_flash.c` is excluded from `SRC_presets` in the host Makefile.
 
 - [ ] **Step 1: Write `firmware/src/presets_flash.c`**
 
-Use the flash map API against the `storage` partition declared in the board devicetree (`stem_player.dts`, `storage_partition` at `0xFF000`, length `0x1000`).
+Use the flash map API against the `storage` partition declared in the board devicetree (`storage_partition` at `0xFF000`, length `0x1000`).
 
 ```c
 #include <zephyr/kernel.h>
@@ -2559,56 +3189,103 @@ Add both prototypes to `presets.h` under a comment marking them as the Zephyr-on
 
 - [ ] **Step 2: Load presets at boot in `main.c`**
 
-After `button_engine_init`, call `preset_store_load` and, on success, push each slot into the engine with `button_engine_set_preset`.
+After `button_engine_init`, call `preset_store_load` and, on success, push each slot into the engine with `button_engine_set_preset`. Loading must not transmit anything: the silent-boot rule still holds.
 
 - [ ] **Step 3: Handle the save action**
 
-Replace the `TODO(Phase 7)` branch. On `BUTTON_ACTION_SAVE_PRESET`:
+Replace the `TODO(Phase 7)` branch:
 
 ```c
 /* Snapshot what the puck last SENT, which is all it knows: MIDI here is
  * one-way, so tweaks made from Push 3 or the synth's own menu are not
- * captured. Accepted in the design. Freeze is deliberately excluded. */
+ * captured. Accepted in the design. Freeze is deliberately excluded by
+ * the profile's capture list. */
 static int snapshot_surface(const profile_t *prof, cc_msg_t *out, int out_max)
 {
     int n = 0;
-    for (int c = 0; c < prof->preset_capture_len && n < out_max; c++) {
+    for (int c = 0; c < prof->preset_capture_len; c++) {
         uint8_t cc = prof->preset_capture[c];
-        for (int f = 0; f < PROFILE_NUM_FADERS; f++) {
+        /* REVIEW: every one of these writes needs its OWN bound check, not
+         * just the outer loop. A generic profile may map the same CC to two
+         * faders, and then one capture entry produces two messages: the
+         * outer check would let the second one run off the end. */
+        for (int f = 0; f < PROFILE_NUM_FADERS && n < out_max; f++) {
             if (prof->fader[f].cc == cc && g_fader[f].have_sent) {
                 out[n++] = (cc_msg_t){ prof->fader[f].channel, cc,
                                        g_fader[f].last_sent };
             }
         }
-        for (int b = 0; b < PROFILE_NUM_BUTTONS; b++) {
+        for (int b = 0; b < PROFILE_NUM_BUTTONS && n < out_max; b++) {
             const button_cfg_t *cfg = &prof->button[b];
-            if (cfg->mode == BTN_MODE_STEP && cfg->cc == cc) {
+            if (cfg->mode == BTN_MODE_CYCLE && cfg->cc == cc) {
                 out[n++] = (cc_msg_t){ cfg->channel, cc,
                                        cfg->steps[button_engine_step_index(&eng, b)] };
             }
+        }
+        if (n >= out_max) {
+            break;
         }
     }
     return n;
 }
 ```
 
-Then `button_engine_set_preset(&eng, slot, snap, n)`, persist the whole bank with `preset_store_save`, and confirm on the LEDs: blink that button's track LED three times fast. A failed write must blink differently (a single long blink) so a silent failure is impossible to miss.
+Then `button_engine_set_preset(&eng, slot, snap, n)` and persist. REVIEW: `preset_store_save` takes a `preset_bank_t`, i.e. *both* slots, and the engine holds them separately, so the bank has to be assembled first. Missing this would have saved one slot and silently blanked the other:
 
-- [ ] **Step 4: Build, flash and test the full gesture**
+```c
+static bool persist_all_slots(void)
+{
+    preset_bank_t bank;
+    memset(&bank, 0, sizeof(bank));
+    for (int s = 0; s < BUTTON_MAX_PRESET_SLOTS; s++) {
+        const preset_slot_t *p = button_engine_get_preset(&eng, s);
+        if (p) {
+            bank.slot[s] = *p;
+        }
+    }
+    return preset_store_save(&bank);
+}
+```
+
+Then confirm on the LEDs: blink that button's track LED three times fast. A failed write must blink differently (a single long blink) so a silent failure is impossible to miss.
+
+- [ ] **Step 4: Arm soft pickup on every recall**
+
+This is the takeover policy, and it is the one place the puck knowingly desyncs its own faders from what it just sent. After queueing a preset's messages, arm pickup on every fader whose CC was in that burst:
+
+```c
+static void arm_pickup_for_recall(const profile_t *prof,
+                                  const cc_msg_t *msgs, int n)
+{
+    for (int m = 0; m < n; m++) {
+        for (int f = 0; f < PROFILE_NUM_FADERS; f++) {
+            if (prof->fader[f].cc == msgs[m].cc &&
+                prof->fader[f].channel == msgs[m].channel) {
+                fader_arm_pickup(&g_fader[f], msgs[m].value);
+            }
+        }
+    }
+}
+```
+
+Call it immediately after the loop that queues the messages, in the same branch. Without this, the first ADC pass after a recall sees the fader sitting where it was, decides that differs from the recalled value, and instantly undoes the whole scene.
+
+- [ ] **Step 5: Build, flash and test the full gesture**
 
 Expected sequence at the rack:
 1. Set the four faders somewhere musical, set shimmer to step 2.
 2. Hold track 3 for two seconds: the LED confirms with three fast blinks.
 3. Move every fader somewhere else.
 4. Tap track 3: all four parameters glide back to the stored scene (the synth's own CC smoothing turns the burst into a morph, which is the whole reason presets are CC bursts rather than a new message type).
-5. Power the puck off, power it back on, tap track 3 again: the same scene replays. This is the persistence test.
-6. Reflash the firmware, power on, tap track 3: the scene is still there, because the flasher stops below `0xFF000`. Confirm it.
+5. **Immediately after the recall, the faders are in pickup:** their LEDs blink, and moving one does nothing until it crosses the recalled value, at which point it catches and its LED goes steady. Test this deliberately: it is the difference between a usable recall and one that is destroyed by the first accidental nudge.
+6. Power the puck off, power it back on, tap track 3 again: the same scene replays. This is the persistence test.
+7. Reflash the firmware, power on, tap track 3: the scene is still there, because the flasher stops below `0xFF000`. Confirm it.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add firmware/src
-git commit -m "feat: presets persist to the storage page and survive reflashing"
+git commit -m "feat: presets persist to flash, recall arms soft pickup"
 ```
 
 ---
@@ -2625,11 +3302,11 @@ The spec's stop rule: if after one real session the puck does not beat Push 3 fo
 
 - [ ] **Step 1: Play one real rack session**
 
-String synth, puck on the desk, Push 3 pushed out of reach. Ride cutoff, reverb wet, delay time and delay feedback from the faders. Use freeze as a pedal at least twice. Step shimmer at least once. Store and recall both presets.
+String synth, puck on the desk, Push 3 pushed out of reach (the takeover policy says the puck owns these four CCs during a performance, so do not ride them from both). Ride cutoff, reverb wet, delay time and delay feedback from the faders. Use freeze as a pedal at least twice. Step shimmer at least once. Store and recall both presets.
 
 - [ ] **Step 2: Write down what actually happened**
 
-In `docs/session-log.md`: what worked, what felt wrong, what was reached for and not found, any stuck or missed message, whether fader resolution felt sufficient at 7 bits, whether the 10 ms rate limit was audible as stepping. Be specific. Vague notes here waste the next session.
+In `docs/session-log.md`: what worked, what felt wrong, what was reached for and not found, any stuck or missed message, whether fader resolution felt sufficient at 7 bits, whether the pickup behaviour after a recall felt natural or fiddly, and whether the 400 ms freeze threshold matched your hands. Be specific. Vague notes here waste the next session.
 
 - [ ] **Step 3: Make the call**
 
@@ -2662,7 +3339,7 @@ ls -l firmware/release/sp1-remote-v1.bin
 
 - [ ] **Step 2: Flash the release image and re-run the smoke test**
 
-Faders move their parameters, freeze works both ways, shimmer steps, presets recall. Do not skip this: the last build tested is the one that ships.
+Silent at boot, faders move their parameters, freeze works both ways, shimmer steps, presets recall and arm pickup. Do not skip this: the last build tested is the one that ships.
 
 - [ ] **Step 3: Finish `README.md`**
 
@@ -2682,13 +3359,14 @@ git push origin main --tags
 ## Parked for later (not in this plan)
 
 - **v1.1 WebSerial profile editor.** A browser page that rewrites the profile table over the CDC console: any CC, any channel, per control. Proven feasible on this hardware by the solderless flasher and by feldd's browser remapping. This is what makes the firmware genuinely generic rather than PopGoblin-shaped.
-- **MIDI clock output.** The lifted TX already carries the code path; it needs a tempo source. Only worth it if the synth-side delay clock-sync work lands.
+- **MIDI clock output.** The transplanted TX already carries the code path; it needs a tempo source. Only worth it if the synth-side delay clock-sync work lands.
 - **Function button as a shift layer** for a second CC bank, which would give palette cycling (CC 43) a home. YAGNI until v1 has been performed with.
 - **Renode emulation** via `softmodded/spire`, for firmware iteration without touching scarce hardware. Worth standing up only if hardware access becomes the bottleneck.
 
 ## Risks carried into execution
 
-- **The TRS MIDI TX is not proven in writing.** Mitigated by Phase 0 preceding the bench, so a polarity flip is a rebuild rather than a dead session, and by Task 1.3's decision tree.
+- **The TRS MIDI TX is not proven in writing, and the sync jack is undocumented.** Mitigated by Phase 0 preceding the bench, by Task 1.2 measuring source resistance and drive current before anything is connected to the Tiliqua, and by Task 1.3's decision tree.
 - **The pucks are unreleased prototypes.** Mitigated by developing on one, by the recovery drill in Task 1.1, and by the BIG FIVE constraints being restated at the top of `main.c`.
-- **Touch-fader jitter becoming CC zipper.** Mitigated by the deadband, the rate limit and the synth's own CC smoothing. The idle-flicker check in Task 6.1 is the canary.
-- **A missed button release leaving freeze stuck on.** Mitigated by the three-pass debounce and by Task 5.3's explicit fast-tap test. This is the single most session-ruining failure mode in the design.
+- **Touch-fader jitter becoming CC zipper.** Mitigated by sizing the deadband from measured jitter in Task 2.2, by the coalescing queue, and by the synth's own CC smoothing. The idle-flicker check in Task 6.1 is the canary.
+- **A missed button release leaving freeze stuck on.** REVIEW correctly pointed out that debounce does nothing for a release that never arrives at all: it only rejects short disagreement. The real mitigations are the pedal timeout in `button_engine_tick` (a pedal held past `BTN_PEDAL_MAX_MS` is force-released), the bounded ADC-error run in `debounced_track_button`, and Task 5.2's fast-tap test. This remains the single most session-ruining failure mode in the design.
+- **A recall being undone by the first fader nudge.** Mitigated by soft pickup (Task 7.2 Step 4) and made visible by the blinking LED (Task 6.1 Step 2).
