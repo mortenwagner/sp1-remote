@@ -1,0 +1,8 @@
+build/
+refs/*
+!refs/fetch.sh
+*.bin
+!firmware/release/*.bin
+.DS_Store
+tests/host/build/
+tmp/
