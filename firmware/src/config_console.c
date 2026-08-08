@@ -24,6 +24,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -37,6 +38,10 @@ static const struct device *const con = DEVICE_DT_GET(DT_CHOSEN(zephyr_console))
 
 static char line[LINE_CAP];
 static int  line_len;
+
+/* Received bytes land here from the UART ISR and are drained by the control
+ * loop, so a long reply is never formatted in interrupt context. */
+RING_BUF_DECLARE(rx_rb, 256);
 
 bool g_diag_quiet;                 /* main.c honours this for its diag line */
 
@@ -200,16 +205,47 @@ static void handle(const char *s)
 	emit("{\"t\":\"err\",\"why\":\"unknown\"}");
 }
 
+/* RX interrupt: move bytes into the ring and return. Zephyr's CDC ACM only
+ * queues its first USB OUT transfer when interrupt RX is enabled, so a
+ * uart_poll_in() loop alone receives NOTHING: the transfer is never started
+ * and the buffer poll_in reads stays empty forever. That was the bug behind
+ * the editor's dead read/save. */
+static void console_isr(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (!uart_irq_update(dev)) {
+		return;
+	}
+	while (uart_irq_rx_ready(dev)) {
+		uint8_t buf[32];
+		int n = uart_fifo_read(dev, buf, sizeof(buf));
+
+		if (n <= 0) {
+			break;
+		}
+		(void)ring_buf_put(&rx_rb, buf, (uint32_t)n);
+	}
+}
+
+void config_console_init(void)
+{
+	if (!device_is_ready(con)) {
+		return;
+	}
+	uart_irq_callback_user_data_set(con, console_isr, NULL);
+	uart_irq_rx_enable(con);
+}
+
 void config_console_poll(void)
 {
-	unsigned char c;
+	uint8_t c;
 
 	if (!device_is_ready(con)) {
 		return;
 	}
-	/* Non-blocking: drain whatever has arrived and return. Called from the
-	 * control loop, so it must never wait. */
-	while (uart_poll_in(con, &c) == 0) {
+	/* Non-blocking: drain whatever the ISR collected and return. */
+	while (ring_buf_get(&rx_rb, &c, 1) == 1) {
 		if (c == '\r') {
 			continue;
 		}

@@ -5,6 +5,11 @@
 
 #include <stdbool.h>
 
+/* Enable interrupt-driven RX. Must be called once at boot: Zephyr's CDC ACM
+ * does not queue its first USB OUT transfer until RX is enabled, so without
+ * this the console receives nothing at all. */
+void config_console_init(void);
+
 /* Drain any received bytes and dispatch complete lines. Non-blocking; call
  * once per control pass. */
 void config_console_poll(void);

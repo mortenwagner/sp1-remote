@@ -210,6 +210,7 @@ int main(void)
 
 	board_io_init();
 	midi_tx_init();
+	config_console_init();
 	button_engine_init(&g_eng, prof);
 
 	/* Load stored scenes. Silent: loading must not transmit, the puck
