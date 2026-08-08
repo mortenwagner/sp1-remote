@@ -32,6 +32,41 @@
 	};
 };
 
+/* ---- TRS MIDI out: hardware UARTE, 31250 baud, TX only ----
+ *
+ * Data on the TIP, driven by P0.20. This follows bnjreece/feldd-sp1-firmware,
+ * which states the electrical path is HARDWARE-VALIDATED: feldd drives an
+ * OP-XY over this jack as TRS Type A with data on the tip at P0.20.
+ *
+ * That matters more than it sounds. Type A is what the Tiliqua's MIDI-in and
+ * a Blokas Midihub both expect, so a PLAIN TRS CABLE works: no adapter, no
+ * tip/sleeve swap, no polarity guess.
+ *
+ * It also replaces a bit-banged GPIO with a peripheral that has its own
+ * DMA, which removes three problems at once: the MIDI_INVERT polarity
+ * unknown, flash writes stalling the CPU mid-byte, and USB interrupts
+ * jittering 32 us bit edges.
+ *
+ * feldd hedges that P0.17 is the alternative if a scope shows otherwise;
+ * that would be a one-line change to the psels below. */
+&pinctrl {
+	uart1_default: uart1_default {
+		group1 { psels = <NRF_PSEL(UART_TX, 0, 20)>; };
+	};
+	uart1_sleep: uart1_sleep {
+		group1 { psels = <NRF_PSEL(UART_TX, 0, 20)>; low-power-enable; };
+	};
+};
+
+&uart1 {
+	compatible = "nordic,nrf-uarte";
+	status = "okay";
+	current-speed = <31250>;
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-1 = <&uart1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
 &adc {
 	channel@2 { reg = <2>; zephyr,gain = "ADC_GAIN_1_6"; zephyr,reference = "ADC_REF_INTERNAL";
 		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
