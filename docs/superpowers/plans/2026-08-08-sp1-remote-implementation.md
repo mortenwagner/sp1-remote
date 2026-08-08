@@ -52,7 +52,7 @@ Fallback if the transplant stalls at board bring-up: a direct looper fork with t
 
 ## Global Constraints
 
-- **Develop on ONE puck only.** The other pucks stay stock until v1 is proven. Mark the dev puck physically before Phase 1.
+- **Develop on ONE puck only, named "pop"** (designated 2026-08-08). The other pucks stay stock until v1 is proven. Every instruction below that says "the dev puck" means pop.
 - **The SP-1 "BIG FIVE" bootloader rules are non-negotiable** (source: `sp1-tape-looper/firmware/src/main.c:40-44`). The app lives at `0x20000`; the watchdog is fed at least every 5 s; bootloader-owned clocks and peripherals are not re-initialised; `SYSTEM_OFF` is the only power-down path; `RESETREAS` is cleared at boot and again before `SYSTEM_OFF`. There is no hardware reset pin on the SP-1. A firmware that hangs without feeding the watchdog, or that cannot get back to the bootloader, is a brick.
 - **Bootloader entry:** power off, hold Track 1 + Track 4, plug in USB-C, release once the Track 1 LED lights.
 - **No button behaviour depends on a release arriving.** Toggle and cycle act on the press; preset acts on the hold (which fires while the button is still down) or on the tap. Only the preset replay waits for a release, and a lost one there costs a replay, not a stuck parameter.
@@ -415,6 +415,17 @@ git commit -m "test: host unit-test harness for the Zephyr-free logic modules"
 
 Hardware from here on. Stop rules are absolute: if Task 1.1 fails, the project stops until recovery works, because everything after it assumes a puck can be un-bricked.
 
+**Ordering, revised 2026-08-08.** Only Task 1.1 is a hard gate. The TRS electrical work (1.2, 1.3, 1.4) needs a multimeter and a hand-made adapter, and neither is required to make progress: because the firmware now has a USB MIDI sink (Task 3.3), the entire control surface can be built and validated over a USB-C cable with no knowledge of the sync jack at all.
+
+So the practical order when the meter and iron are not to hand is:
+
+1. **Task 1.1** (recovery drill) — the gate, and it needs nothing but the puck, a cable and Chrome.
+2. **Phase 2** (board bring-up) then **Task 3.2 + 3.3** (queue and USB MIDI). At that point pop is a working MIDI controller on the desk.
+3. **Phases 4 to 7** developed and tested entirely over USB.
+4. **Tasks 1.2, 1.3, 3.1** (the TRS path) whenever the meter and a way to make the adapter are available. Nothing above depends on them.
+
+The only thing this ordering defers is driving the actual string synth, since popgoblin has no USB MIDI host. Everything else gets built and proven first.
+
 ### Task 1.1: Flash and recovery drill on the dev puck
 
 **Files:**
@@ -423,9 +434,11 @@ Hardware from here on. Stop rules are absolute: if Task 1.1 fails, the project s
 **Interfaces:**
 - Produces: a dev puck running the looper firmware, and a written recovery procedure that has actually been executed twice.
 
-- [ ] **Step 1: Mark the dev puck**
+- [ ] **Step 1: Confirm the dev puck**
 
-Physically label one puck (tape, marker, anything). Record any serial or distinguishing mark in `docs/flashing.md`. The other pucks do not get connected during this project.
+The dev puck is **pop**. Label it if it is not already obvious which one it is, and record any serial or distinguishing mark in `docs/flashing.md`. The other pucks do not get connected during this project.
+
+Needed for this task: pop, a USB-C cable, and Chrome. No multimeter, no adapter, no rack.
 
 - [ ] **Step 2: Serve the local flasher**
 
@@ -465,6 +478,8 @@ git commit -m "docs: flash and recovery drill executed on the dev puck"
 ### Task 1.2: Sync jack electrical survey and adapter
 
 The spec's revised pre-flight #1 asks for four things specifically: pin order, idle polarity, source resistance and drive current, because the Tiliqua input is a current loop and not a logic-level UART line. This task answers all four.
+
+**Deferrable.** Nothing before Task 3.1 depends on it, and with the USB MIDI sink in place the whole firmware can be built and tested without it. Do it when a multimeter is to hand. If you want a go/no-go answer sooner without one, Task 1.3's straight-cable attempt into a USB MIDI interface is a binary version of the same test: bytes or no bytes, with no numbers to interpret.
 
 **Files:**
 - Create: `docs/hardware-notes.md`
@@ -535,7 +550,13 @@ git commit -m "docs: SP-1 sync jack survey and TRS adapter wiring"
 
 - [ ] **Step 1: Connect to a known-good MIDI input**
 
-SP-1 sync jack, through the Task 1.2 adapter, into any MIDI interface that reaches the Mac (a USB MIDI interface with TRS-A or DIN in; use a TRS-to-DIN adapter if that is what is at hand).
+SP-1 sync jack, through the Task 1.2 adapter, into a USB MIDI interface that reaches the Mac.
+
+**Use the cheap interface, never the Tiliqua, for this first connection.** Its input stage is the same standard opto arrangement, so it proves the same thing, and if something about the SP-1's drive turns out to be wrong it is a replaceable box rather than the r5 motherboard that finds out.
+
+**Worth one free attempt before building anything:** try a plain straight TRS cable, SP-1 to interface. It costs nothing and the risk is low (a standard MIDI input is opto-isolated with a series resistor and a protection diode). If clock bytes appear, the wiring question is answered and Task 1.2's adapter is unnecessary.
+
+Expect it probably will not work, though, and the reason is worth knowing. A TRS-A input runs its opto between **tip and ring**, with the sleeve as shield. The SP-1 drives MIDI on its **ring** and returns to ground on its **sleeve** (its tip carries Pocket Operator sync). A straight cable therefore connects the SP-1's ring to the right place but leaves the loop open, because the return never reaches the interface's tip. Closing it needs tip and sleeve swapped at one end, which is not a standard adapter: it is two TRS pigtails joined, or a screw-terminal breakout at each end. No soldering required if the pigtails are bare-wire.
 
 - [ ] **Step 2: Watch raw bytes**
 
