@@ -154,6 +154,23 @@ Four numbers advancing in lockstep proved the whole transmit path was healthy
 and moved the search to the listener, where the problem actually was.
 Instrument before theorising.
 
+## Phases 5 and 6 verified, 2026-08-08
+
+**Freeze (CC 64), 12 messages:** `127, 0, 127, 0, ...` strictly alternating,
+zero repeated values, including a run of deliberately fast presses. Every
+press registered. The toggle design plus the three-pass debounce is solid on
+this noisy shared ladder, and a missed press would have shown here as an
+inverted state.
+
+**Shimmer (CC 105), 7 messages:** `16, 112, 80, 48, 16, 112, 80`, which
+decode against popgoblin's ShimmerLevel enum as Boost, Off, Low, Full,
+Boost, Off, Low. It began on Full, where the synth boots, and cycled in the
+spec's off/low/full/boost order with every value landing mid-bucket. This
+confirms on hardware the inverted-enum fix from the first review pass: the
+original {0, 42, 85, 127} would have had Off and Boost swapped.
+
+No unexpected CCs in 330 messages.
+
 ## Sync jack
 
 Not yet measured; the multimeter work (Task 1.2) is deferred. What is known:
