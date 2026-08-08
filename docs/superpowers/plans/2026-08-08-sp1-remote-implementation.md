@@ -556,7 +556,19 @@ SP-1 sync jack, through the Task 1.2 adapter, into a USB MIDI interface that rea
 
 **Worth one free attempt before building anything:** connect the interface to the sync jack as directly as its form allows, a straight TRS cable if it has a socket, or plugged straight in if its TRS end is a plug. It costs nothing and the risk is low (a standard MIDI input is opto-isolated with a series resistor and a protection diode). If clock bytes appear, the wiring question is answered and Task 1.2's adapter is unnecessary.
 
-Before doing that, find out which TRS MIDI standard the interface follows. Type A and Type B put data on opposite conductors, and some interfaces are switchable. That one fact decides whether a direct connection has any chance, and it is usually in the manual or on the box.
+**The interface is Type A** (established 2026-08-08): it works with Push 3, and Push 3's 3.5 mm MIDI ports are TRS Type A, MMA-compliant, with Ableton stating explicitly that Type B adapters do not work. The Tiliqua is Type A as well, which is why Push 3 drives it today. **One adapter therefore serves both**: build it against the cheap interface, then use it unchanged on the Tiliqua.
+
+What that means concretely:
+
+| | Type A input (interface and Tiliqua) | SP-1 sync jack |
+|---|---|---|
+| Tip | data / current return | Pocket Operator sync |
+| Ring | +V current source | MIDI data |
+| Sleeve | shield | ground (the return) |
+
+Ring passes straight through; **tip and sleeve swap at one end**; the SP-1's tip is left unconnected so its PO pulses stay out of the loop. No standard part does this (Type A/B adapters swap tip and ring, not tip and sleeve), so it is two solderless screw-terminal 3.5 mm plugs and two wires, or two bare-wire pigtails twisted together.
+
+Try the direct connection first anyway: some interfaces tie sleeve to circuit ground rather than leaving it floating as a shield, and if this one does, it may work with no adapter at all.
 
 Expect it probably will not work, though, and the reason is worth knowing. A TRS-A input runs its opto between **tip and ring**, with the sleeve as shield. The SP-1 drives MIDI on its **ring** and returns to ground on its **sleeve** (its tip carries Pocket Operator sync). A straight cable therefore connects the SP-1's ring to the right place but leaves the loop open, because the return never reaches the interface's tip. Closing it needs tip and sleeve swapped at one end, which is not a standard adapter: it is two TRS pigtails joined, or a screw-terminal breakout at each end. No soldering required if the pigtails are bare-wire.
 
