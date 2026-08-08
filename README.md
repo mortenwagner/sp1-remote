@@ -46,10 +46,18 @@ make -C tests/host test
 
 ## Building the firmware
 
-Needs Zephyr v4.3.1 and Zephyr SDK 0.17.4. See `docs/toolchain.md` once
-Phase 0 of the plan is complete.
+Needs Zephyr v4.3.1 and Zephyr SDK 0.17.4; see `docs/toolchain.md` for the
+install and the environment.
+
+The repo must live at a path **without spaces** (Zephyr's devicetree
+preprocessing splits on whitespace, and a symlink does not help). The
+canonical location is `~/dev/sp1-remote`.
 
 ```sh
+source ~/zephyrproject/.venv/bin/activate
+export ZEPHYR_BASE=~/zephyrproject/zephyr
+export ZEPHYR_SDK_INSTALL_DIR=~/zephyr-sdk-0.17.4
+export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
 west build -p -b stem_player firmware -- -DBOARD_ROOT=$(pwd)
 ```
 

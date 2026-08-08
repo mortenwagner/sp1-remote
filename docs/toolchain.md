@@ -52,6 +52,12 @@ path. The source tree has to physically live somewhere without spaces.
 Host unit tests (`make -C tests/host test`) are unaffected, since they are
 plain clang.
 
+**This is why the repo lives at `~/dev/sp1-remote`** (decided 2026-08-08),
+with a symlink at `~/Documents/Other Creations/dev/sp1-remote` so it still
+appears alongside tiliqua and dodilab. Same arrangement as mw-dashboard.
+Work in the real path; the symlink is for browsing. Verified: building the
+looper from the new location still reproduces byte-identically.
+
 ## Toolchain proof: a byte-identical reproduction
 
 Building `chattock/sp1-tape-looper` unmodified from a space-free path
@@ -78,12 +84,11 @@ Steps to reproduce:
 ```sh
 # one-time: patch the Zephyr tree for the looper's USB audio
 cd ~/zephyrproject/zephyr
-git apply /path/to/sp1-remote/refs/sp1-tape-looper/zephyr-patches/uac2-windows-fs-feedback.patch
+git apply ~/dev/sp1-remote/refs/sp1-tape-looper/zephyr-patches/uac2-windows-fs-feedback.patch
 
-# build from a space-free path
-cp -R /path/to/sp1-remote/refs/sp1-tape-looper ~/sp1work/looper
-cd ~/sp1work/looper
-west build -p -b stem_player firmware -- -DBOARD_ROOT="$HOME/sp1work/looper"
+# build
+cd ~/dev/sp1-remote/refs/sp1-tape-looper
+west build -p -b stem_player firmware -- -DBOARD_ROOT="$HOME/dev/sp1-remote/refs/sp1-tape-looper"
 ```
 
 Note that this project's own firmware does NOT need the UAC2 patch: it has
