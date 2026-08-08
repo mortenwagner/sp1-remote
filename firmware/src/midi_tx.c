@@ -4,6 +4,11 @@
 #include "midi_trs.h"
 #include "midi_usb.h"
 
+/* Approximate activity counters, for diagnosis only. Written by the drain
+ * thread and read by the control loop without synchronisation, and they
+ * count ATTEMPTS: midi_trs_send_byte can silently drop a byte if the line
+ * is stuck, and usbd_midi_send's result is not checked. Good enough to see
+ * which stage stopped advancing, which is all they are for. */
 static uint32_t n_pushed, n_drained, n_usb;
 
 #define MIDI_TX_STACK 640
@@ -81,6 +86,29 @@ void midi_tx_init(void)
 	k_thread_create(&tx_tcb, tx_stack, MIDI_TX_STACK, midi_tx_thread,
 			NULL, NULL, NULL, MIDI_TX_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_tcb, "midi_tx");
+}
+
+bool midi_tx_idle(uint32_t timeout_ms)
+{
+	uint32_t waited = 0;
+
+	for (;;) {
+		k_mutex_lock(&tx_lock, K_FOREVER);
+		uint8_t left = txq_count(&tx_q);
+		k_mutex_unlock(&tx_lock);
+
+		if (left == 0) {
+			/* One spacing interval more, so the final message's
+			 * last byte has certainly left the wire. */
+			k_msleep(MIDI_TX_SPACING_MS + 2);
+			return true;
+		}
+		if (waited >= timeout_ms) {
+			return false;
+		}
+		k_msleep(2);
+		waited += 2;
+	}
 }
 
 uint32_t midi_tx_pushed(void)  { return n_pushed; }

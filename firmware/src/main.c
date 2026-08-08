@@ -217,21 +217,28 @@ int main(void)
 		}
 	}
 
-	uint32_t held_ms = 0;
+	uint32_t held_since = 0u;
 
 	for (;;) {
 		board_io_feed_wdt();
 
 		int pressed = debounced_track_button();
 
-		/* ---- power off on a long function-button hold ---- */
+		/* ---- power off on a long function-button hold ----
+		 * Timed from uptime, not by adding CONTROL_PERIOD_MS per pass:
+		 * the loop's real period is work plus 5 ms, and a diagnostic
+		 * pass, a page dump or a flash write all make it longer, so
+		 * counting iterations would stretch a nominal 2.5 s hold. */
 		if (board_io_function_held()) {
-			held_ms += CONTROL_PERIOD_MS;
-			if (held_ms >= POWER_HOLD_MS) {
+			uint32_t now_ms = (uint32_t)k_uptime_get();
+
+			if (held_since == 0u) {
+				held_since = now_ms ? now_ms : 1u;
+			} else if ((uint32_t)(now_ms - held_since) >= POWER_HOLD_MS) {
 				board_io_power_off();       /* does not return */
 			}
 		} else {
-			held_ms = 0;
+			held_since = 0u;
 		}
 
 		/* ---- panel readout ----
@@ -335,6 +342,7 @@ int main(void)
 			bool play_down = (pressed == 4);
 
 			if (play_down && !play_was_down) {
+				(void)midi_tx_idle(200);
 				preset_store_dump();
 			}
 			play_was_down = play_down;
@@ -356,6 +364,10 @@ int main(void)
 								  (int)ARRAY_SIZE(snap));
 
 					button_engine_set_preset(&g_eng, slot, snap, sn);
+					/* Let the wire go quiet first: a flash
+					 * write stalls the CPU long enough to
+					 * corrupt a bit-banged MIDI byte. */
+					(void)midi_tx_idle(200);
 					g_save_ok = persist_all_slots();
 					g_save_blink_until = now + 900u;
 					continue;

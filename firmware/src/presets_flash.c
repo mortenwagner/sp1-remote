@@ -36,15 +36,31 @@ static int page_read(void)
 	return rc;
 }
 
-/* Is every slot either erased or a record we wrote? If not, something else
- * owns this page and we must not touch it. */
+/* Is this page ours to write?
+ *
+ * Every byte of the page must be accounted for: either part of a record we
+ * can decode, or erased. Note the tail: 102 records of 40 bytes cover 4080
+ * bytes, and the remaining 16 are checked separately. An earlier version
+ * scanned only the records while the erase covered all 4096, so foreign
+ * data living solely in that tail would have been declared safe and then
+ * destroyed.
+ *
+ * HONEST LIMIT, worth stating because the name overpromises: this shows the
+ * page holds nothing foreign RIGHT NOW. It cannot show the bootloader will
+ * not use the page later, or that it expects the page to stay erased. No
+ * software check can. What makes the risk acceptable is that the flasher
+ * deliberately preserves this page, that a human inspects the dump before
+ * the first save, and that the only thing at stake if we are wrong is
+ * bootloader state we can reflash around. */
 bool preset_store_is_safe(void)
 {
 	if (page_read() != 0) {
 		return false;
 	}
-	for (uint32_t off = 0; off + PRESET_REC_SIZE <= PAGE_LEN;
-	     off += PRESET_REC_SIZE) {
+
+	uint32_t off = 0;
+
+	for (; off + PRESET_REC_SIZE <= PAGE_LEN; off += PRESET_REC_SIZE) {
 		bool erased = true;
 
 		for (uint32_t i = 0; i < PRESET_REC_SIZE; i++) {
@@ -60,7 +76,14 @@ bool preset_store_is_safe(void)
 		preset_bank_t tmp;
 
 		if (!preset_record_decode(page_buf + off, &tmp)) {
-			return false;      /* foreign content: hands off */
+			return false;      /* foreign or torn: hands off */
+		}
+	}
+
+	/* The tail the record loop cannot reach. */
+	for (; off < PAGE_LEN; off++) {
+		if (page_buf[off] != 0xFF) {
+			return false;
 		}
 	}
 	return true;
@@ -80,8 +103,11 @@ bool preset_store_save(const preset_bank_t *bank)
 	bool ok = false;
 
 	if (!preset_store_is_safe()) {
-		printk("preset: REFUSING to write, page 0xFF000 holds foreign "
-		       "data. Dump it with PLAY before trusting this.\n");
+		printk("preset: REFUSING to write. Page 0xFF000 holds data this "
+		       "firmware did not write, or a record torn by a reset "
+		       "mid-write. Dump it with PLAY and inspect before "
+		       "trusting it. If it is our own torn record, "
+		       "preset_store_repair() erases the page.\n");
 		return false;
 	}
 	if (flash_area_open(STORAGE_ID, &fa) != 0) {
@@ -154,4 +180,27 @@ void preset_store_dump(void)
 		}
 		printk("\n");
 	}
+}
+
+/* Repair path for the one self-inflicted way saving can lock itself out: a
+ * reset during a 40-byte write leaves a non-erased, undecodable record, and
+ * from then on preset_store_is_safe() refuses everything. Without this the
+ * only fix would be a tool that erases a page the flasher deliberately
+ * preserves.
+ *
+ * Deliberately NOT automatic, and deliberately not reachable by accident:
+ * it erases the page, which is exactly what we refuse to do when ownership
+ * is in doubt. A human should read the dump first and decide. */
+bool preset_store_repair(void)
+{
+	const struct flash_area *fa;
+	bool ok = false;
+
+	if (flash_area_open(STORAGE_ID, &fa) != 0) {
+		return false;
+	}
+	ok = (flash_area_erase(fa, 0, PAGE_LEN) == 0);
+	flash_area_close(fa);
+	printk("preset: page erase %s\n", ok ? "OK" : "FAILED");
+	return ok;
 }

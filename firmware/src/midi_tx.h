@@ -22,8 +22,18 @@
 void midi_tx_init(void);
 void midi_tx_send(cc_msg_t m);
 
-/* Diagnostics: how many messages were pushed, how many actually reached
- * each sink, and whether a USB host has opened the MIDI interface. */
+/* Diagnostics, APPROXIMATE. These count attempts, not confirmed delivery:
+ * a TRS byte can be dropped if the line is stuck, and the USB send result
+ * is not checked. They are read without synchronisation. Their purpose is
+ * to show which stage stopped advancing, which is what located the problem
+ * when faders appeared to send nothing. */
+/* Block until the queue is empty and the wire has gone idle, up to a
+ * timeout. Call before a flash erase or write: on nRF52840 a word write
+ * stalls the CPU for ~41 us and a page erase for ~85 ms, while one
+ * bit-banged MIDI bit is 32 us, so a flash operation landing mid-byte
+ * corrupts that byte's framing. Returns true if the queue drained. */
+bool midi_tx_idle(uint32_t timeout_ms);
+
 uint32_t midi_tx_pushed(void);
 uint32_t midi_tx_drained(void);
 uint32_t midi_tx_usb_sent(void);

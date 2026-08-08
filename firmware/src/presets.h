@@ -52,5 +52,6 @@ bool preset_store_is_safe(void);   /* is the page ours to write? */
 bool preset_store_load(preset_bank_t *out);
 bool preset_store_save(const preset_bank_t *bank);
 void preset_store_dump(void);      /* Task 7.0, read only */
+bool preset_store_repair(void);    /* erase the page; human-triggered only */
 
 #endif /* SP1_PRESETS_H */

@@ -316,17 +316,47 @@ void board_io_feed_wdt(void)
 	}
 }
 
+/* Install our own watchdog channel, if the hardware will accept one.
+ *
+ * The BOOTLOADER has already started a watchdog before we run, and on
+ * nRF52 a running WDT cannot be reconfigured, so this normally fails. That
+ * is fine and expected: board_io_feed_wdt() writes NRF_WDT->RR directly and
+ * feeds whichever watchdog is actually running. This function is belt and
+ * braces for the case where the bootloader did NOT start one.
+ *
+ * Two things the original got wrong. The nRF driver requires
+ * WDT_FLAG_RESET_SOC; a zero flags field is rejected with -ENOTSUP. And
+ * both return codes were discarded, so a rejected install was followed by
+ * a setup call on a channel that did not exist, leaving the driver in an
+ * invalid state while the comment claimed a working fallback. */
 static void wdt_start(void)
 {
 	if (!device_is_ready(wdt)) {
+		printk("wdt: device not ready; relying on the bootloader's\n");
 		return;
 	}
+
 	struct wdt_timeout_cfg cfg = {
+		.window.min = 0,
 		.window.max = 4000,
 		.callback   = NULL,
+		.flags      = WDT_FLAG_RESET_SOC,
 	};
-	(void)wdt_install_timeout(wdt, &cfg);
-	(void)wdt_setup(wdt, 0);
+
+	int ch = wdt_install_timeout(wdt, &cfg);
+
+	if (ch < 0) {
+		/* Expected when the bootloader's watchdog is already running.
+		 * Direct RR writes still feed it, so this is not a problem. */
+		printk("wdt: install %d, using the running watchdog\n", ch);
+		return;
+	}
+
+	int rc = wdt_setup(wdt, 0);
+
+	if (rc < 0) {
+		printk("wdt: setup %d\n", rc);
+	}
 	board_io_feed_wdt();
 }
 
