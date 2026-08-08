@@ -17,7 +17,7 @@ USB MIDI controller.
 | Phase | | |
 |---|---|---|
 | 0 | toolchain | done, proved by a byte-identical rebuild of the reference firmware |
-| 1 | recovery drill | **passed**; the TRS electrical work is deferred until a multimeter is to hand |
+| 1 | recovery drill | **passed**; TRS proven later with a plain cable, no multimeter needed |
 | 2 | board bring-up | done and verified: LEDs, watchdog, power-off, charging, DFU escape hatch |
 | 3 | transmit path | done; USB MIDI verified live on the Mac |
 | 4 | faders | done and verified: all four drive CC 102/104/107/108 across 0-127 |
