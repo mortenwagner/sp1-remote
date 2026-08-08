@@ -78,6 +78,39 @@ static int jint(const char *s, const char *key, int missing)
 	return (int)strtol(p, NULL, 10);
 }
 
+/* Read "key":[a,b,c,d] into out[]. Returns how many were found. */
+static int jarray(const char *s, const char *key, uint8_t *out, int max)
+{
+	char pat[16];
+
+	snprintk(pat, sizeof(pat), "\"%s\"", key);
+	const char *p = strstr(s, pat);
+
+	if (p == NULL) {
+		return 0;
+	}
+	p = strchr(p, '[');
+	if (p == NULL) {
+		return 0;
+	}
+	p++;
+
+	int n = 0;
+
+	while (n < max && *p && *p != ']') {
+		while (*p == ' ' || *p == ',') {
+			p++;
+		}
+		if (*p < '0' || *p > '9') {
+			break;
+		}
+		long v = strtol(p, (char **)&p, 10);
+
+		out[n++] = (uint8_t)(v < 0 ? 0 : (v > 127 ? 127 : v));
+	}
+	return n;
+}
+
 static bool jhas(const char *s, const char *key)
 {
 	char pat[16];
@@ -195,6 +228,37 @@ static void handle(const char *s)
 			if (ch >= 0) {
 				g_profile.button[i].channel = (uint8_t)ch;
 			}
+
+			/* Cycle values, the step it starts on, and the toggle's
+			 * two levels. All optional: a set that names only cc
+			 * leaves the rest alone. */
+			uint8_t st[PROFILE_MAX_STEPS];
+			int nst = jarray(s, "st", st, PROFILE_MAX_STEPS);
+
+			if (nst > 0) {
+				for (int k = 0; k < nst; k++) {
+					g_profile.button[i].steps[k] = st[k];
+				}
+				g_profile.button[i].n_steps = (uint8_t)nst;
+			}
+
+			int init = jint(s, "init", -1);
+
+			if (init >= 0 && g_profile.button[i].n_steps > 0) {
+				g_profile.button[i].init_step =
+					(uint8_t)(init % g_profile.button[i].n_steps);
+			}
+
+			int on  = jint(s, "on", -1);
+			int off = jint(s, "off", -1);
+
+			if (on  >= 0 && on  <= 127) {
+				g_profile.button[i].on_value  = (uint8_t)on;
+			}
+			if (off >= 0 && off <= 127) {
+				g_profile.button[i].off_value = (uint8_t)off;
+			}
+
 			emit("{\"t\":\"ok\"}");
 			return;
 		}

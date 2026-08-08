@@ -67,12 +67,17 @@
                        border:1px solid var(--line); background:var(--panel);
                        color:var(--ink); }
   input[type=number]:focus { outline:1px solid var(--accent); border-color:var(--accent); }
+  .steps { margin-top:9px; padding-top:9px; border-top:1px solid var(--line); }
+  .steps .fld label { width:auto; min-width:46px; }
+  .lands { color:var(--accent); font-size:11px; }
+  .init { color:var(--dim); font-size:11px; margin-top:7px; }
+  input[type=number].narrow { width:62px; }
 </style>
 </head>
 <body>
 <header>
   <h1>SP-1 Remote</h1>
-  <span class="sub" id="ver">build 2</span>
+  <span class="sub" id="ver">build 3</span>
   <span class="sub"><span id="dot"></span><span id="state">not connected</span></span>
   <button id="connect">connect</button>
   <span class="sub" id="rate"></span>
@@ -168,14 +173,88 @@ const FNAME = ['fader 1', 'fader 2', 'fader 3', 'fader 4'];
 const BNAME = ['track 1', 'track 2', 'track 3', 'track 4'];
 const MODE  = ['toggle', 'cycle', 'preset', 'list'];
 
+/* PopGoblin's ShimmerLevel enum iterates Boost, Full, Low, Off and picks
+ * index = cc * 4 / 128. So a value does not mean a number to the synth, it
+ * means a BUCKET, and 63 vs 64 silently changes which one. The editor shows
+ * the landing state next to each value so that is visible rather than
+ * discovered by ear. Only meaningful for CC 105; other CCs are continuous. */
+const SHIMMER = ['Boost', 'Full', 'Low', 'Off'];
+function lands(cc, v) {
+  if (cc !== 105) return '';
+  return SHIMMER[Math.min(3, Math.floor(v * 4 / 128))];
+}
+
 function ctlCard(kind, i, name, sub) {
+  const extra = kind === 'b' ? `<div class="steps" id="b${i}extra"></div>` : '';
   return `<div class="ctl">
       <h3>${name} <span class="who">${sub}</span></h3>
       <div class="fld"><label>CC</label>
         <input type="number" min="0" max="127" id="${kind}${i}cc" disabled></div>
       <div class="fld"><label>channel</label>
         <input type="number" min="1" max="16" id="${kind}${i}ch" disabled></div>
+      ${extra}
     </div>`;
+}
+
+/* Build the mode-specific controls once the puck has told us what a button
+ * is: a toggle gets its two levels, a cycle gets its ordered values plus
+ * the step it starts on. */
+function renderButtonExtra(o) {
+  const el = $('b' + o.i + 'extra');
+  if (!el) return;
+  const cc = o.cc;
+
+  if (o.mode === 0) {                       /* toggle */
+    el.innerHTML = `
+      <div class="fld"><label>on</label>
+        <input type="number" class="narrow" min="0" max="127" id="b${o.i}on" value="${o.on}"></div>
+      <div class="fld"><label>off</label>
+        <input type="number" class="narrow" min="0" max="127" id="b${o.i}off" value="${o.off}"></div>
+      <div class="init">the synth treats 64 and above as on</div>`;
+    for (const f of ['on', 'off']) {
+      $('b' + o.i + f).addEventListener('change', e => {
+        const m = { t: 'set', b: o.i }; m[f] = parseInt(e.target.value, 10);
+        send(m); $('editstate').textContent = 'edited, not saved';
+      });
+    }
+    return;
+  }
+
+  if (o.mode === 1) {                       /* cycle */
+    let h = '<div class="init">values in cycle order</div>';
+    for (let k = 0; k < o.n; k++) {
+      h += `<div class="fld"><label>${k + 1}.</label>
+              <input type="number" class="narrow" min="0" max="127"
+                     id="b${o.i}s${k}" value="${o.st[k]}">
+              <span class="lands" id="b${o.i}l${k}">${lands(cc, o.st[k])}</span></div>`;
+    }
+    h += `<div class="fld" style="margin-top:8px"><label>starts on</label>
+            <input type="number" class="narrow" min="1" max="${o.n}"
+                   id="b${o.i}init" value="${o.init + 1}"></div>
+          <div class="init">where the synth is at power-on, so the puck agrees
+            with it without sending anything</div>`;
+    el.innerHTML = h;
+
+    const push = () => {
+      const st = [];
+      for (let k = 0; k < o.n; k++) {
+        const v = parseInt($('b' + o.i + 's' + k).value, 10) || 0;
+        st.push(v);
+        $('b' + o.i + 'l' + k).textContent = lands(cc, v);
+      }
+      send({ t: 'set', b: o.i, st: st,
+             init: (parseInt($('b' + o.i + 'init').value, 10) || 1) - 1 });
+      $('editstate').textContent = 'edited, not saved';
+    };
+    for (let k = 0; k < o.n; k++) {
+      $('b' + o.i + 's' + k).addEventListener('change', push);
+    }
+    $('b' + o.i + 'init').addEventListener('change', push);
+    return;
+  }
+
+  el.innerHTML = '<div class="init">preset slot ' +
+                 (o.slot === 0 ? 'A' : 'B') + ', hold 2 s to store the surface</div>';
 }
 {
   let h = '';
@@ -224,9 +303,12 @@ function onJson(o) {
     const k = o.t[0];
     $(k + o.i + 'cc').value = o.cc;
     $(k + o.i + 'ch').value = o.ch + 1;
-    if (o.t === 'b_r' && MODE[o.mode]) {
-      const card = $(k + o.i + 'cc').closest('.ctl').querySelector('.who');
-      card.textContent = BTNNAME[o.i] + ' \u00b7 ' + MODE[o.mode];
+    if (o.t === 'b_r') {
+      if (MODE[o.mode]) {
+        const card = $(k + o.i + 'cc').closest('.ctl').querySelector('.who');
+        card.textContent = BTNNAME[o.i] + ' \u00b7 ' + MODE[o.mode];
+      }
+      renderButtonExtra(o);
     }
   } else if (o.t === 'ok') {
     if (o.saved) $('editstate').textContent = 'saved to flash';
