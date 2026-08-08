@@ -554,7 +554,9 @@ SP-1 sync jack, through the Task 1.2 adapter, into a USB MIDI interface that rea
 
 **Use the cheap interface, never the Tiliqua, for this first connection.** Its input stage is the same standard opto arrangement, so it proves the same thing, and if something about the SP-1's drive turns out to be wrong it is a replaceable box rather than the r5 motherboard that finds out.
 
-**Worth one free attempt before building anything:** try a plain straight TRS cable, SP-1 to interface. It costs nothing and the risk is low (a standard MIDI input is opto-isolated with a series resistor and a protection diode). If clock bytes appear, the wiring question is answered and Task 1.2's adapter is unnecessary.
+**Worth one free attempt before building anything:** connect the interface to the sync jack as directly as its form allows, a straight TRS cable if it has a socket, or plugged straight in if its TRS end is a plug. It costs nothing and the risk is low (a standard MIDI input is opto-isolated with a series resistor and a protection diode). If clock bytes appear, the wiring question is answered and Task 1.2's adapter is unnecessary.
+
+Before doing that, find out which TRS MIDI standard the interface follows. Type A and Type B put data on opposite conductors, and some interfaces are switchable. That one fact decides whether a direct connection has any chance, and it is usually in the manual or on the box.
 
 Expect it probably will not work, though, and the reason is worth knowing. A TRS-A input runs its opto between **tip and ring**, with the sleeve as shield. The SP-1 drives MIDI on its **ring** and returns to ground on its **sleeve** (its tip carries Pocket Operator sync). A straight cable therefore connects the SP-1's ring to the right place but leaves the loop open, because the return never reaches the interface's tip. Closing it needs tip and sleeve swapped at one end, which is not a standard adapter: it is two TRS pigtails joined, or a screw-terminal breakout at each end. No soldering required if the pigtails are bare-wire.
 
