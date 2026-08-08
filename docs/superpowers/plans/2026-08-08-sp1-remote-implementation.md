@@ -69,7 +69,9 @@ Fallback if the transplant stalls at board bring-up: a direct looper fork with t
 - **Takeover policy:** during a performance the puck is the authoritative controller for its four CCs. After a preset recall (the one case where the puck's own faders desync from what it just sent), each affected fader enters soft pickup: its output is suppressed until its physical position crosses the recalled value, then it takes over. Cross-to-catch, not touch-to-jump.
 - **Freeze is a plain toggle (CC 64, sustain semantics, at least 64 is on).** Press alternates 127 and 0. Release does nothing at all. DECIDED 2026-08-08, replacing the spec's timed tap-versus-hold machine, on the grounds that release was load-bearing there: a release that was late, mis-decoded or never delivered stranded freeze in the on state with no way back, which is the worst possible failure on a live gesture. With an inert release, a lost press costs one extra press and a dropped message re-syncs on the next one. The cost is the sub-second stab, where two quick taps are harder to place than a press-and-lift; that is parked, not lost, and the first session decides whether it is missed. This also removes the momentary threshold, the pedal timeout, and all duration plumbing from the button layer.
 - **Default MIDI channel is 1** (wire value 0). Per-control channel is configurable in the profile table.
-- **Zephyr v4.3.1 with SDK 0.17.4.** Pinned.
+- **Zephyr v4.3.1 with SDK 0.17.4.** Pinned. Installed and verified 2026-08-08; see `docs/toolchain.md`.
+- **The firmware source tree must live at a path with NO SPACES.** Zephyr's devicetree preprocessing splits the overlay list on whitespace, so `~/Documents/Other Creations/...` fails with `fatal error: /Users/morten/Documents/Other: No such file or directory`. A symlink does not help: west and CMake resolve it back to the physical path. Host unit tests are unaffected (plain clang), so only the firmware build cares. This is a Zephyr limitation, not something to work around.
+- **`ZEPHYR_TOOLCHAIN_VARIANT=zephyr` must be exported**, or the build dies in `FindZephyr-sdk.cmake:57` on an unquoted variable expansion, with a CMake syntax error rather than a useful message.
 - **Licence:** MIT, matching the upstream code being transplanted. Every transplanted block keeps an attribution comment naming the source file and line range.
 - **No em-dashes in prose written into this repo** (README, docs, commit messages). Use colons, commas, parentheses.
 
@@ -259,6 +261,11 @@ Expected: modified files under `subsys/usb`.
 
 - [ ] **Step 5: Build the looper unmodified**
 
+DONE 2026-08-08. The result was **byte-identical** to the repo's shipped `sp1_looper.bin` (md5 `d926854d751236e0ac21445828c7ed39`), which is a stronger proof than the size comparison this step originally asked for. Consequence: **Task 1.1 does not need a self-built image.** Flash the shipped `refs/sp1-tape-looper/sp1_looper.bin`; it is exactly what this toolchain produces.
+
+Kept below for reproduction.
+
+
 ```bash
 source ~/zephyrproject/.venv/bin/activate
 export ZEPHYR_BASE=~/zephyrproject/zephyr
@@ -434,7 +441,7 @@ Power the puck off. Hold Track 1 + Track 4. Plug in USB-C. Release once the Trac
 
 - [ ] **Step 4: Flash the looper build from Task 0.2**
 
-Open **firmware utility**, select `refs/sp1-tape-looper/build/zephyr/zephyr.bin`, connect, flash. Expected: progress runs to 100 percent and the puck reboots into the looper (LED behaviour per the looper README).
+Open **firmware utility**, select `refs/sp1-tape-looper/sp1_looper.bin`, connect, flash. (Task 0.2 proved a local build reproduces this file byte for byte, so there is nothing to gain from building it again first.) Expected: progress runs to 100 percent and the puck reboots into the looper (LED behaviour per the looper README).
 
 - [ ] **Step 5: Recover, twice**
 
