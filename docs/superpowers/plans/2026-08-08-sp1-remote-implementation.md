@@ -1,5 +1,11 @@
 # SP-1 Remote Implementation Plan
 
+> **Progress, 2026-08-08.** Phases 0 to 6 are implemented and verified on
+> hardware; Phase 7 is implemented but not yet exercised. Measured results
+> and the constants they corrected are in `docs/hardware-notes.md`. Task 1.2
+> and 1.3 (the TRS electrical work) are deliberately deferred: with the USB
+> MIDI sink in place, nothing else depends on them.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn one Teenage Engineering SP-1 into a generic 4-fader / 4-button TRS-MIDI controller whose shipped default profile drives the PopGoblin string synth's existing CC map.

@@ -11,10 +11,28 @@ one table in `firmware/src/profile.c`.
 
 ## Status
 
-Planning complete, firmware not yet built. The pure logic (fader
-conditioning, soft pickup, button behaviour, the transmit queue, preset
-serialisation) is written and unit-tested on the host. Hardware bring-up
-starts at Phase 1 of the plan.
+Working on hardware. Pop (the dev puck) is a functioning 4-fader, 4-button
+USB MIDI controller.
+
+| Phase | | |
+|---|---|---|
+| 0 | toolchain | done, proved by a byte-identical rebuild of the reference firmware |
+| 1 | recovery drill | **passed**; the TRS electrical work is deferred until a multimeter is to hand |
+| 2 | board bring-up | done and verified: LEDs, watchdog, power-off, charging, DFU escape hatch |
+| 3 | transmit path | done; USB MIDI verified live on the Mac |
+| 4 | faders | done and verified: all four drive CC 102/104/107/108 across 0-127 |
+| 5 | buttons | done and verified: freeze toggles cleanly, shimmer steps the synth's enum |
+| 6 | LEDs | done, not yet eyeballed |
+| 7 | presets | written, not yet exercised on hardware |
+
+Untested in the whole signal chain: only the bit-banged TRS jack, which
+needs a multimeter and a hand-made adapter. Everything else is measured.
+
+- Plan: `docs/superpowers/plans/2026-08-08-sp1-remote-implementation.md`
+- Design: `docs/spec.md`
+- Measurements: `docs/hardware-notes.md`
+- Flashing and recovery: `docs/flashing.md`
+- Reviews: `docs/codex-review-2026-08-08.md`, `docs/fable-review-2026-08-08.md`
 
 - Plan: `docs/superpowers/plans/2026-08-08-sp1-remote-implementation.md`
 - Design: `docs/spec.md`
