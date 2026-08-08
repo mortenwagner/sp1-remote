@@ -53,6 +53,7 @@ Fallback if the transplant stalls at board bring-up: a direct looper fork with t
 - **Develop on ONE puck only.** The other pucks stay stock until v1 is proven. Mark the dev puck physically before Phase 1.
 - **The SP-1 "BIG FIVE" bootloader rules are non-negotiable** (source: `sp1-tape-looper/firmware/src/main.c:40-44`). The app lives at `0x20000`; the watchdog is fed at least every 5 s; bootloader-owned clocks and peripherals are not re-initialised; `SYSTEM_OFF` is the only power-down path; `RESETREAS` is cleared at boot and again before `SYSTEM_OFF`. There is no hardware reset pin on the SP-1. A firmware that hangs without feeding the watchdog, or that cannot get back to the bootloader, is a brick.
 - **Bootloader entry:** power off, hold Track 1 + Track 4, plug in USB-C, release once the Track 1 LED lights.
+- **No button behaviour depends on a release arriving.** Toggle and cycle act on the press; preset acts on the hold (which fires while the button is still down) or on the tap. Only the preset replay waits for a release, and a lost one there costs a replay, not a stuck parameter.
 - **The firmware must carry its own escape hatch.** REVIEW: the looper does not rely on the power-off path alone. It implements `enter_dfu()` (`main.c:5743-5752`): holding Track 1 + Track 4 for 1.2 s *while the app is running* writes `GPREGRET = 0x57` and calls `NVIC_SystemReset()`, so the bootloader's own button scan catches the still-held combo and enters DFU. It is triggered from the control loop at `main.c:6981`. This is the difference between "recoverable" and "recoverable only while the app is healthy", and Task 2.1 transplants it. A power-off drill on a healthy app does not test recovery from a wedged one.
 - **Transmit spacing is set by the receiver, not by us.** REVIEW: popgoblin's MIDI FIFO is 8 entries deep (`top.py:150`) and its firmware drains exactly one entry per 5 ms timer ISR (`main.rs:28,100`), so the synth absorbs at most 200 messages per second. The drain thread therefore paces messages at 5 ms, which is also why coalescing matters: it is the queue, not the wire, that must absorb a fast sweep.
 - **Flash image format:** raw `.bin`, written to `0x20000`, maximum size `0xDF000` (`solderless/utility/js/protocol.js:8-13`). The flasher never touches `0xFF000` and above, so the 4 KB storage partition survives a reflash. Preset data must live there and nowhere else.
@@ -63,7 +64,7 @@ Fallback if the transplant stalls at board bring-up: a direct looper fork with t
 - **Transmit path:** send-on-change with a per-fader deadband, and **every** message goes through ONE coalescing transmit queue where the latest value for a given (channel, CC) wins. No per-fader millisecond rate limit: four faders naively limited to one message per 10 ms each would occupy about 38 percent of the 31250 baud wire, and coalescing keeps worst-case latency flat when all four move together. The control loop must never block on transmission.
 - **The puck is silent at power-on.** It has no readback: MIDI here is one-way. The first ADC reading of each fader only seeds state. Nothing is transmitted until a control is actually moved or pressed.
 - **Takeover policy:** during a performance the puck is the authoritative controller for its four CCs. After a preset recall (the one case where the puck's own faders desync from what it just sent), each affected fader enters soft pickup: its output is suppressed until its physical position crosses the recalled value, then it takes over. Cross-to-catch, not touch-to-jump.
-- **Freeze timing (CC 64, sustain semantics, at least 64 is on):** press always sends 127. Release before 400 ms leaves it latched and sends nothing. Release after 400 ms sends 0, because that press was a momentary pedal. A press while latched sends 0 and unlatches.
+- **Freeze is a plain toggle (CC 64, sustain semantics, at least 64 is on).** Press alternates 127 and 0. Release does nothing at all. DECIDED 2026-08-08, replacing the spec's timed tap-versus-hold machine, on the grounds that release was load-bearing there: a release that was late, mis-decoded or never delivered stranded freeze in the on state with no way back, which is the worst possible failure on a live gesture. With an inert release, a lost press costs one extra press and a dropped message re-syncs on the next one. The cost is the sub-second stab, where two quick taps are harder to place than a press-and-lift; that is parked, not lost, and the first session decides whether it is missed. This also removes the momentary threshold, the pedal timeout, and all duration plumbing from the button layer.
 - **Default MIDI channel is 1** (wire value 0). Per-control channel is configurable in the profile table.
 - **Zephyr v4.3.1 with SDK 0.17.4.** Pinned.
 - **Licence:** MIT, matching the upstream code being transplanted. Every transplanted block keeps an attribution comment naming the source file and line range.
@@ -114,7 +115,7 @@ sp1-remote/
 
 `controls.c`, `buttons.c`, `presets.c`, `profile.c` and `txqueue.c` must not include any Zephyr header. That is what makes the host tests possible, and it is the single most important structural rule in this plan.
 
-**Every pure-logic implementation and every test in this plan was compiled and run before the plan was committed**, with `clang -std=c11 -Wall -Wextra -Werror`: 46 tests across five suites, all passing, including the regression tests for the bugs the adversarial review found. A failure when you run them means a transcription slip, not a design problem.
+**Every pure-logic implementation and every test in this plan was compiled and run before the plan was committed**, with `clang -std=c11 -Wall -Wextra -Werror`: 45 tests across five suites, all passing, including regression tests for the bugs the adversarial review found and for the lost-release case the toggle design is built to survive. A failure when you run them means a transcription slip, not a design problem.
 
 ---
 
@@ -1377,9 +1378,9 @@ git commit -m "feat: coalescing transmit queue with a drain thread"
   - `bool fader_update(fader_state_t *st, int raw, uint8_t *out_value);`
   - `void fader_arm_pickup(fader_state_t *st, uint8_t target);`
   - `bool fader_pickup_armed(const fader_state_t *st);`
-  - `uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms, uint32_t *held_ms_out);`
+  - `uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms);`
 
-The press duration is an out-parameter of `btn_update` rather than a separate query, and that is deliberate: see the REVIEW note in Task 5.2.
+No duration is returned, because nothing consumes one: the only timed gesture left is hold-to-save, and `BTN_EV_HOLD` fires while the button is still down.
 
 Note there is no timestamp parameter: rate limiting lives in the transmit queue now, not per fader.
 
@@ -1511,51 +1512,29 @@ static void test_arming_pickup_adopts_the_recalled_value(void)
 static void test_press_then_short_release_is_a_tap(void)
 {
     btn_state_t st = {0};
-    uint32_t h;
-    CHECK_EQ(btn_update(&st, true,  0,   &h), BTN_EV_PRESS);
-    CHECK_EQ(btn_update(&st, true,  50,  &h), 0);
-    CHECK_EQ(btn_update(&st, false, 120, &h), BTN_EV_RELEASE | BTN_EV_TAP);
-}
-
-/* THE REGRESSION THAT MATTERS: the release event must carry the real press
- * duration. An earlier design read the duration with a second call after
- * btn_update had already cleared the timer, so every release reported 0 ms
- * and the momentary-pedal branch was unreachable: a long hold latched
- * freeze instead of releasing it. */
-static void test_release_reports_the_real_press_duration(void)
-{
-    btn_state_t st = {0};
-    uint32_t h = 0xFFFFFFFFu;
-    CHECK_EQ(btn_update(&st, true, 1000, &h), BTN_EV_PRESS);
-    CHECK_EQ(h, 0);
-    CHECK_EQ(btn_update(&st, true, 1500, &h), 0);
-    CHECK_EQ(h, 500);
-    /* 900 ms is a release, and also a TAP in the sense that no 2 s
-     * hold fired. The pedal decision is made from h, NOT from the TAP
-     * flag: that is exactly the distinction this test pins down. */
-    CHECK_EQ(btn_update(&st, false, 1900, &h), BTN_EV_RELEASE | BTN_EV_TAP);
-    CHECK_EQ(h, 900);
-    CHECK(h >= BTN_MOMENTARY_MS);
+    CHECK_EQ(btn_update(&st, true, 0), BTN_EV_PRESS);
+    CHECK_EQ(btn_update(&st, true, 50), 0);
+    CHECK_EQ(btn_update(&st, false, 120), BTN_EV_RELEASE | BTN_EV_TAP);
 }
 
 static void test_hold_fires_once_and_release_is_not_a_tap(void)
 {
     btn_state_t st = {0};
-    uint32_t h;
-    CHECK_EQ(btn_update(&st, true, 0, &h), BTN_EV_PRESS);
-    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS - 1, &h), 0);
-    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS, &h), BTN_EV_HOLD);
-    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS + 500, &h), 0);
-    CHECK_EQ(btn_update(&st, false, BTN_HOLD_MS + 600, &h), BTN_EV_RELEASE);
+    CHECK_EQ(btn_update(&st, true, 0), BTN_EV_PRESS);
+    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS - 1), 0);
+    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS), BTN_EV_HOLD);
+    CHECK_EQ(btn_update(&st, true, BTN_HOLD_MS + 500), 0);
+    CHECK_EQ(btn_update(&st, false, BTN_HOLD_MS + 600), BTN_EV_RELEASE);
 }
 
-static void test_held_ms_measures_from_the_press(void)
+/* The hold fires while the button is still DOWN, which is why the save
+ * gesture does not depend on a release arriving either. */
+static void test_hold_fires_while_still_held(void)
 {
     btn_state_t st = {0};
-    uint32_t h;
-    btn_update(&st, true, 1000, &h);
-    btn_update(&st, true, 1350, &h);
-    CHECK_EQ(h, 350);
+    CHECK_EQ(btn_update(&st, true, 1000), BTN_EV_PRESS);
+    CHECK_EQ(btn_update(&st, true, 1000 + BTN_HOLD_MS - 1), 0);
+    CHECK_EQ(btn_update(&st, true, 1000 + BTN_HOLD_MS), BTN_EV_HOLD);
 }
 
 /* The control loop's uptime counter is 32-bit milliseconds, which wraps
@@ -1564,20 +1543,17 @@ static void test_held_ms_measures_from_the_press(void)
 static void test_hold_detection_survives_the_millisecond_wrap(void)
 {
     btn_state_t st = {0};
-    uint32_t h, near_wrap = 0xFFFFFF00u;
-    CHECK_EQ(btn_update(&st, true, near_wrap, &h), BTN_EV_PRESS);
-    CHECK_EQ(btn_update(&st, true, near_wrap + 100u, &h), 0);
-    CHECK_EQ(h, 100);
-    CHECK_EQ(btn_update(&st, true, near_wrap + BTN_HOLD_MS, &h), BTN_EV_HOLD);
-    CHECK_EQ(h, BTN_HOLD_MS);
+    uint32_t near_wrap = 0xFFFFFF00u;
+    CHECK_EQ(btn_update(&st, true, near_wrap), BTN_EV_PRESS);
+    CHECK_EQ(btn_update(&st, true, near_wrap + 100u), 0);
+    CHECK_EQ(btn_update(&st, true, near_wrap + BTN_HOLD_MS), BTN_EV_HOLD);
 }
 
 static void test_idle_button_reports_nothing(void)
 {
     btn_state_t st = {0};
-    uint32_t h;
-    CHECK_EQ(btn_update(&st, false, 0, &h), 0);
-    CHECK_EQ(btn_update(&st, false, 5000, &h), 0);
+    CHECK_EQ(btn_update(&st, false, 0), 0);
+    CHECK_EQ(btn_update(&st, false, 5000), 0);
 }
 
 int main(void)
@@ -1594,9 +1570,8 @@ int main(void)
     RUN(test_pickup_from_above_also_catches);
     RUN(test_arming_pickup_adopts_the_recalled_value);
     RUN(test_press_then_short_release_is_a_tap);
-    RUN(test_release_reports_the_real_press_duration);
     RUN(test_hold_fires_once_and_release_is_not_a_tap);
-    RUN(test_held_ms_measures_from_the_press);
+    RUN(test_hold_fires_while_still_held);
     RUN(test_hold_detection_survives_the_millisecond_wrap);
     RUN(test_idle_button_reports_nothing);
     TEST_MAIN_END();
@@ -1640,8 +1615,10 @@ bool fader_update(fader_state_t *st, int raw, uint8_t *out_value);
 void fader_arm_pickup(fader_state_t *st, uint8_t target);
 bool fader_pickup_armed(const fader_state_t *st);
 
+/* Hold-to-save a preset. The ONLY duration this firmware measures, and it
+ * fires while the button is still down, so nothing depends on a release
+ * arriving. */
 #define BTN_HOLD_MS        2000
-#define BTN_MOMENTARY_MS   400
 
 #define BTN_EV_PRESS    0x01u
 #define BTN_EV_HOLD     0x02u
@@ -1654,15 +1631,8 @@ typedef struct {
     uint32_t down_at_ms;
 } btn_state_t;
 
-/* Feed the debounced pressed/released state once per control pass.
- *
- * held_ms_out ALWAYS receives the duration of the press this event refers
- * to, including on the release pass. It is an out-parameter rather than a
- * separate btn_held_ms() call precisely because the release clears the
- * timer: a caller that asked afterwards would always read zero, and the
- * momentary-pedal branch would be unreachable. */
-uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms,
-                   uint32_t *held_ms_out);
+/* Feed the debounced pressed/released state once per control pass. */
+uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms);
 
 #endif /* SP1_CONTROLS_H */
 ```
@@ -1748,26 +1718,25 @@ bool fader_pickup_armed(const fader_state_t *st)
     return st->pickup_armed;
 }
 
-uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms,
-                   uint32_t *held_ms_out)
+uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms)
 {
     uint8_t ev = 0;
-    uint32_t held = st->down ? (uint32_t)(now_ms - st->down_at_ms) : 0u;
 
     if (pressed_now && !st->down) {
         st->down       = true;
         st->hold_fired = false;
         st->down_at_ms = now_ms;
-        *held_ms_out   = 0u;
         return BTN_EV_PRESS;
     }
 
     if (pressed_now && st->down) {
-        if (!st->hold_fired && held >= BTN_HOLD_MS) {
+        /* Unsigned subtraction, so the 32-bit millisecond wrap is a
+         * non-event. Fires once per press. */
+        if (!st->hold_fired &&
+            (uint32_t)(now_ms - st->down_at_ms) >= BTN_HOLD_MS) {
             st->hold_fired = true;
             ev |= BTN_EV_HOLD;
         }
-        *held_ms_out = held;
         return ev;
     }
 
@@ -1777,11 +1746,9 @@ uint8_t btn_update(btn_state_t *st, bool pressed_now, uint32_t now_ms,
         if (!st->hold_fired) {
             ev |= BTN_EV_TAP;
         }
-        *held_ms_out = held;   /* measured BEFORE the state was cleared */
         return ev;
     }
 
-    *held_ms_out = 0u;
     return 0;
 }
 ```
@@ -2119,8 +2086,7 @@ git commit -m "feat: four faders drive their profile CCs through the queue"
 **Interfaces:**
 - Produces:
   - `void button_engine_init(button_engine_t *e, const profile_t *prof);`
-  - `int  button_engine_event(button_engine_t *e, int idx, uint8_t ev, uint32_t held_ms, uint32_t now_ms, cc_msg_t *out, int out_max);`
-  - `int  button_engine_tick(button_engine_t *e, uint32_t now_ms, cc_msg_t *out, int out_max);`
+  - `int  button_engine_event(button_engine_t *e, int idx, uint8_t ev, cc_msg_t *out, int out_max);`
   - `int  button_engine_pending_save_slot(const button_engine_t *e);`
   - `void button_engine_set_preset(button_engine_t *e, int slot, const cc_msg_t *msgs, int len);`
   - `const preset_slot_t *button_engine_get_preset(const button_engine_t *e, int slot);`
@@ -2146,99 +2112,88 @@ static void setup(void)
     button_engine_init(&eng, &profile_popgoblin_default);
 }
 
-static void test_freeze_press_sends_on(void)
+/* --- freeze: a plain toggle on the press --- */
+
+static void test_freeze_press_turns_on(void)
 {
     setup();
-    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
+    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, out, OUT_MAX);
     CHECK_EQ(n, 1);
     CHECK_EQ(out[0].cc, 64);
     CHECK_EQ(out[0].value, 127);
+    CHECK(button_engine_is_latched(&eng, 0));
 }
 
-static void test_freeze_tap_latches_on_release(void)
+static void test_freeze_second_press_turns_off(void)
 {
     setup();
-    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
-    int n = button_engine_event(&eng, 0, BTN_EV_RELEASE | BTN_EV_TAP, 120, 0,
-                                out, OUT_MAX);
-    CHECK_EQ(n, 0);
-}
-
-static void test_freeze_second_tap_sends_off(void)
-{
-    setup();
-    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
-    button_engine_event(&eng, 0, BTN_EV_RELEASE | BTN_EV_TAP, 120, 0, out, OUT_MAX);
-    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
+    button_engine_event(&eng, 0, BTN_EV_PRESS, out, OUT_MAX);
+    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, out, OUT_MAX);
     CHECK_EQ(n, 1);
-    CHECK_EQ(out[0].cc, 64);
     CHECK_EQ(out[0].value, 0);
+    CHECK(!button_engine_is_latched(&eng, 0));
 }
 
-static void test_freeze_long_press_is_momentary(void)
+/* THE POINT OF THE TOGGLE DESIGN: release is inert, so a release that is
+ * late, early, or never delivered at all cannot strand freeze in the on
+ * state. The earlier timed-release design could, and that was the single
+ * most session-ruining failure mode in the surface. */
+static void test_freeze_ignores_release_entirely(void)
 {
     setup();
-    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 0, out, OUT_MAX);
-    int n = button_engine_event(&eng, 0, BTN_EV_RELEASE, 900, 0, out, OUT_MAX);
-    CHECK_EQ(n, 1);
-    CHECK_EQ(out[0].cc, 64);
-    CHECK_EQ(out[0].value, 0);
+    button_engine_event(&eng, 0, BTN_EV_PRESS, out, OUT_MAX);
+
+    CHECK_EQ(button_engine_event(&eng, 0, BTN_EV_RELEASE, out, OUT_MAX), 0);
+    CHECK_EQ(button_engine_event(&eng, 0, BTN_EV_RELEASE | BTN_EV_TAP,
+                                 out, OUT_MAX), 0);
+    CHECK_EQ(button_engine_event(&eng, 0, BTN_EV_HOLD, out, OUT_MAX), 0);
+    /* Still on, whatever the release did or did not do. */
+    CHECK(button_engine_is_latched(&eng, 0));
 }
+
+/* A press whose release is lost still toggles correctly next time: the
+ * state machine only ever advances on a press. */
+static void test_freeze_survives_a_lost_release(void)
+{
+    setup();
+    button_engine_event(&eng, 0, BTN_EV_PRESS, out, OUT_MAX);   /* on */
+    /* release lost entirely: no event delivered at all */
+    int n = button_engine_event(&eng, 0, BTN_EV_PRESS, out, OUT_MAX);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(out[0].value, 0);                                  /* off */
+}
+
+/* --- shimmer: each press steps --- */
 
 static void test_shimmer_steps_and_wraps(void)
 {
     setup();
     const uint8_t want[5] = { 16, 112, 80, 48, 16 };
     for (int i = 0; i < 5; i++) {
-        int n = button_engine_event(&eng, 1, BTN_EV_RELEASE | BTN_EV_TAP, 100, 0,
-                                out, OUT_MAX);
+        int n = button_engine_event(&eng, 1, BTN_EV_PRESS, out, OUT_MAX);
         CHECK_EQ(n, 1);
         CHECK_EQ(out[0].cc, 105);
         CHECK_EQ(out[0].value, want[i]);
     }
 }
 
+static void test_shimmer_release_sends_nothing(void)
+{
+    setup();
+    CHECK_EQ(button_engine_event(&eng, 1, BTN_EV_RELEASE | BTN_EV_TAP,
+                                 out, OUT_MAX), 0);
+}
+
 /* PopGoblin boots with shimmer at Full. The puck must start on that same
- * step so its first tap is a real change and its LED does not lie, and it
- * must reach that agreement WITHOUT transmitting. */
+ * step so its first press is a real change and its LED does not lie, and
+ * it must reach that agreement WITHOUT transmitting. */
 static void test_cycle_starts_on_the_synths_default_step(void)
 {
     setup();
     CHECK_EQ(button_engine_step_index(&eng, 1), 2);
 }
 
-/* A release that never arrives (a flaky ladder read, a crash mid-press)
- * would otherwise leave freeze on for the rest of the session. */
-static void test_pedal_timeout_force_releases_freeze(void)
-{
-    setup();
-    button_engine_event(&eng, 0, BTN_EV_PRESS, 0, 1000, out, OUT_MAX);
-
-    /* Nothing happens while the timeout has not expired. */
-    CHECK_EQ(button_engine_tick(&eng, 1000 + BTN_PEDAL_MAX_MS - 1,
-                                out, OUT_MAX), 0);
-
-    int n = button_engine_tick(&eng, 1000 + BTN_PEDAL_MAX_MS, out, OUT_MAX);
-    CHECK_EQ(n, 1);
-    CHECK_EQ(out[0].cc, 64);
-    CHECK_EQ(out[0].value, 0);
-
-    /* And only once. */
-    CHECK_EQ(button_engine_tick(&eng, 1000 + BTN_PEDAL_MAX_MS + 5000,
-                                out, OUT_MAX), 0);
-}
-
-static void test_tick_is_silent_when_no_pedal_is_down(void)
-{
-    setup();
-    CHECK_EQ(button_engine_tick(&eng, 999999, out, OUT_MAX), 0);
-}
-
-static void test_shimmer_press_alone_sends_nothing(void)
-{
-    setup();
-    CHECK_EQ(button_engine_event(&eng, 1, BTN_EV_PRESS, 0, 0, out, OUT_MAX), 0);
-}
+/* --- presets: the only mode that waits for a release --- */
 
 static void test_preset_tap_replays_the_stored_list(void)
 {
@@ -2247,7 +2202,7 @@ static void test_preset_tap_replays_the_stored_list(void)
         { 0, 102, 30 }, { 0, 104, 90 }, { 0, 107, 12 },
     };
     button_engine_set_preset(&eng, 0, scene, 3);
-    int n = button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP, 100, 0,
+    int n = button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP,
                                 out, OUT_MAX);
     CHECK_EQ(n, 3);
     CHECK_EQ(out[0].cc, 102);
@@ -2256,18 +2211,25 @@ static void test_preset_tap_replays_the_stored_list(void)
     CHECK_EQ(out[2].value, 12);
 }
 
+static void test_preset_press_alone_does_not_replay(void)
+{
+    setup();
+    cc_msg_t scene[1] = { { 0, 102, 30 } };
+    button_engine_set_preset(&eng, 0, scene, 1);
+    CHECK_EQ(button_engine_event(&eng, 2, BTN_EV_PRESS, out, OUT_MAX), 0);
+}
+
 static void test_empty_preset_sends_nothing(void)
 {
     setup();
-    CHECK_EQ(button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP, 100, 0,
-                                out, OUT_MAX), 0);
+    CHECK_EQ(button_engine_event(&eng, 2, BTN_EV_RELEASE | BTN_EV_TAP,
+                                 out, OUT_MAX), 0);
 }
 
 static void test_preset_hold_requests_a_save(void)
 {
     setup();
-    int n = button_engine_event(&eng, 3, BTN_EV_HOLD, BTN_HOLD_MS, 0,
-                                out, OUT_MAX);
+    int n = button_engine_event(&eng, 3, BTN_EV_HOLD, out, OUT_MAX);
     CHECK_EQ(n, BUTTON_ACTION_SAVE_PRESET);
     CHECK_EQ(button_engine_pending_save_slot(&eng), 1);
 }
@@ -2275,26 +2237,34 @@ static void test_preset_hold_requests_a_save(void)
 static void test_release_after_a_save_does_not_also_replay(void)
 {
     setup();
-    button_engine_event(&eng, 3, BTN_EV_HOLD, BTN_HOLD_MS, 0, out, OUT_MAX);
-    CHECK_EQ(button_engine_event(&eng, 3, BTN_EV_RELEASE, BTN_HOLD_MS + 100, 0,
-                                out, OUT_MAX), 0);
+    button_engine_event(&eng, 3, BTN_EV_HOLD, out, OUT_MAX);
+    CHECK_EQ(button_engine_event(&eng, 3, BTN_EV_RELEASE, out, OUT_MAX), 0);
+}
+
+static void test_negative_preset_length_is_refused(void)
+{
+    setup();
+    cc_msg_t scene[1] = { { 0, 102, 30 } };
+    button_engine_set_preset(&eng, 0, scene, -1);
+    const preset_slot_t *p = button_engine_get_preset(&eng, 0);
+    CHECK_EQ(p->len, 0);
 }
 
 int main(void)
 {
-    RUN(test_freeze_press_sends_on);
-    RUN(test_freeze_tap_latches_on_release);
-    RUN(test_freeze_second_tap_sends_off);
-    RUN(test_freeze_long_press_is_momentary);
+    RUN(test_freeze_press_turns_on);
+    RUN(test_freeze_second_press_turns_off);
+    RUN(test_freeze_ignores_release_entirely);
+    RUN(test_freeze_survives_a_lost_release);
     RUN(test_shimmer_steps_and_wraps);
-    RUN(test_shimmer_press_alone_sends_nothing);
+    RUN(test_shimmer_release_sends_nothing);
     RUN(test_cycle_starts_on_the_synths_default_step);
-    RUN(test_pedal_timeout_force_releases_freeze);
-    RUN(test_tick_is_silent_when_no_pedal_is_down);
     RUN(test_preset_tap_replays_the_stored_list);
+    RUN(test_preset_press_alone_does_not_replay);
     RUN(test_empty_preset_sends_nothing);
     RUN(test_preset_hold_requests_a_save);
     RUN(test_release_after_a_save_does_not_also_replay);
+    RUN(test_negative_preset_length_is_refused);
     TEST_MAIN_END();
 }
 ```
@@ -2325,12 +2295,8 @@ Expected: FAIL, `buttons.h` not found.
 
 #define BUTTON_MAX_PRESET_SLOTS 2
 
+/* Returned by button_engine_event instead of a message count. */
 #define BUTTON_ACTION_SAVE_PRESET (-1)
-
-/* A pedal press held longer than this is treated as a lost release and
- * force-released, so a missed RELEASE can never leave freeze stuck on for
- * the rest of a session. Far longer than any real pedal gesture. */
-#define BTN_PEDAL_MAX_MS 20000u
 
 typedef struct {
     cc_msg_t msg[PROFILE_MAX_CAPTURE];
@@ -2339,32 +2305,33 @@ typedef struct {
 
 typedef struct {
     const profile_t *prof;
-    bool     latched[PROFILE_NUM_BUTTONS];
-    bool     pending_pedal[PROFILE_NUM_BUTTONS];
-    uint8_t  step_idx[PROFILE_NUM_BUTTONS];
-    bool     save_armed[PROFILE_NUM_BUTTONS];
-    uint32_t pedal_started_ms[PROFILE_NUM_BUTTONS];
+    bool     latched[PROFILE_NUM_BUTTONS];    /* TOGGLE state */
+    uint8_t  step_idx[PROFILE_NUM_BUTTONS];   /* CYCLE position */
+    bool     save_armed[PROFILE_NUM_BUTTONS]; /* a hold consumed the release */
     int      pending_save_slot;
     preset_slot_t preset[BUTTON_MAX_PRESET_SLOTS];
 } button_engine_t;
 
 void button_engine_init(button_engine_t *e, const profile_t *prof);
 
+/* Feed one button event mask from btn_update. Returns the number of
+ * messages written to out, 0 for nothing to send, or
+ * BUTTON_ACTION_SAVE_PRESET when the caller must snapshot the surface into
+ * button_engine_pending_save_slot(e) and then call button_engine_set_preset.
+ *
+ * No duration parameter, deliberately. Nothing here reacts to HOW LONG a
+ * button was held: TOGGLE and CYCLE act on the press, PRESET acts on the
+ * HOLD event (which fires while the button is still down) or on the tap.
+ * That is what makes a lost RELEASE harmless. */
 int  button_engine_event(button_engine_t *e, int idx, uint8_t ev,
-                         uint32_t held_ms, uint32_t now_ms,
                          cc_msg_t *out, int out_max);
-
-/* Call once per control pass. Returns messages that must be sent because
- * of the passage of time alone: today, force-releasing a pedal whose
- * RELEASE never arrived. */
-int  button_engine_tick(button_engine_t *e, uint32_t now_ms,
-                        cc_msg_t *out, int out_max);
 
 int  button_engine_pending_save_slot(const button_engine_t *e);
 void button_engine_set_preset(button_engine_t *e, int slot,
                               const cc_msg_t *msgs, int len);
 const preset_slot_t *button_engine_get_preset(const button_engine_t *e, int slot);
 
+/* For the LED layer. */
 uint8_t button_engine_step_index(const button_engine_t *e, int idx);
 bool    button_engine_is_latched(const button_engine_t *e, int idx);
 
@@ -2381,7 +2348,6 @@ void button_engine_init(button_engine_t *e, const profile_t *prof)
 {
     memset(e, 0, sizeof(*e));
     e->prof = prof;
-    e->pending_save_slot = -1;
 
     for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
         const button_cfg_t *cfg = &prof->button[i];
@@ -2413,11 +2379,8 @@ static int emit(cc_msg_t *out, int out_max, int n,
 }
 
 int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
-                        uint32_t held_ms, uint32_t now_ms,
                         cc_msg_t *out, int out_max)
 {
-    const uint32_t held_ms_now = now_ms;
-
     if (idx < 0 || idx >= PROFILE_NUM_BUTTONS) {
         return 0;
     }
@@ -2427,34 +2390,26 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
     switch (cfg->mode) {
 
     case BTN_MODE_TOGGLE:
+        /* Plain alternation on the press, and nothing at all on release.
+         * The synth treats CC 64 as a level (>= 64 is on), so the puck
+         * simply alternates between the two levels.
+         *
+         * Release is deliberately inert. An earlier design timed the
+         * release to offer a momentary pedal as well, which meant a lost
+         * RELEASE left freeze on for the rest of the session with no way
+         * back. Here a lost PRESS costs one more press and nothing else,
+         * and a dropped message re-syncs on the next press. */
         if (ev & BTN_EV_PRESS) {
-            if (e->latched[idx]) {
-                e->latched[idx]       = false;
-                e->pending_pedal[idx] = false;
-                return emit(out, out_max, n, cfg->channel, cfg->cc,
-                            cfg->off_value);
-            }
-            e->pending_pedal[idx]    = true;
-            e->pedal_started_ms[idx] = held_ms_now;
-            return emit(out, out_max, n, cfg->channel, cfg->cc, cfg->on_value);
-        }
-        if (ev & BTN_EV_RELEASE) {
-            if (!e->pending_pedal[idx]) {
-                return 0;
-            }
-            e->pending_pedal[idx] = false;
-            if (held_ms >= BTN_MOMENTARY_MS) {
-                e->latched[idx] = false;
-                return emit(out, out_max, n, cfg->channel, cfg->cc,
-                            cfg->off_value);
-            }
-            e->latched[idx] = true;
-            return 0;
+            e->latched[idx] = !e->latched[idx];
+            return emit(out, out_max, n, cfg->channel, cfg->cc,
+                        e->latched[idx] ? cfg->on_value : cfg->off_value);
         }
         return 0;
 
     case BTN_MODE_CYCLE:
-        if (ev & BTN_EV_TAP) {
+        /* Also on the press: a stepped parameter should move under the
+         * finger, not when it leaves. */
+        if (ev & BTN_EV_PRESS) {
             if (cfg->n_steps == 0) {
                 return 0;
             }
@@ -2465,7 +2420,7 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
         return 0;
 
     case BTN_MODE_LIST:
-        if (ev & BTN_EV_TAP) {
+        if (ev & BTN_EV_PRESS) {
             for (int i = 0; i < cfg->n_list; i++) {
                 n = emit(out, out_max, n, cfg->list[i].channel,
                          cfg->list[i].cc, cfg->list[i].value);
@@ -2475,6 +2430,10 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
         return 0;
 
     case BTN_MODE_PRESET:
+        /* The one mode that MUST wait for the release, because a press
+         * alone cannot yet be distinguished from the start of a
+         * hold-to-save. The HOLD event fires while the button is still
+         * down, so the save does not depend on a release either. */
         if (ev & BTN_EV_HOLD) {
             e->save_armed[idx]   = true;
             e->pending_save_slot = cfg->preset_slot;
@@ -2482,7 +2441,7 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
         }
         if (ev & BTN_EV_RELEASE) {
             if (e->save_armed[idx]) {
-                e->save_armed[idx] = false;
+                e->save_armed[idx] = false;  /* the hold already acted */
                 return 0;
             }
             if (!(ev & BTN_EV_TAP)) {
@@ -2502,27 +2461,6 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
         return 0;
     }
     return 0;
-}
-
-int button_engine_tick(button_engine_t *e, uint32_t now_ms,
-                       cc_msg_t *out, int out_max)
-{
-    int n = 0;
-    for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
-        if (!e->pending_pedal[i]) {
-            continue;
-        }
-        if ((uint32_t)(now_ms - e->pedal_started_ms[i]) < BTN_PEDAL_MAX_MS) {
-            continue;
-        }
-        /* The release never arrived. Let go on the performer's behalf:
-         * a stuck freeze ruins the rest of the session. */
-        const button_cfg_t *cfg = &e->prof->button[i];
-        e->pending_pedal[i] = false;
-        e->latched[i]       = false;
-        n = emit(out, out_max, n, cfg->channel, cfg->cc, cfg->off_value);
-    }
-    return n;
 }
 
 int button_engine_pending_save_slot(const button_engine_t *e)
@@ -2643,13 +2581,12 @@ Then, inside the loop after the fader block:
         cc_msg_t msgs[PROFILE_MAX_CAPTURE];
 
         for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
-            uint32_t held;
-            uint8_t  ev = btn_update(&g_btn[i], pressed == i, now, &held);
+            uint8_t ev = btn_update(&g_btn[i], pressed == i, now);
             if (!ev) {
                 continue;
             }
-            int n = button_engine_event(&eng, i, ev, held, now,
-                                        msgs, (int)(sizeof(msgs) / sizeof(msgs[0])));
+            int n = button_engine_event(&eng, i, ev, msgs,
+                                        (int)(sizeof(msgs) / sizeof(msgs[0])));
             if (n == BUTTON_ACTION_SAVE_PRESET) {
                 /* TODO(Phase 7): snapshot the surface and persist it. */
                 continue;
@@ -2658,18 +2595,9 @@ Then, inside the loop after the fader block:
                 midi_tx_send(msgs[k]);
             }
         }
-
-        /* Time-driven events: today, force-releasing a pedal whose RELEASE
-         * never arrived. Cheap, and it is the only thing standing between a
-         * dropped release and a freeze that stays on all night. */
-        int tn = button_engine_tick(&eng, now, msgs,
-                                    (int)(sizeof(msgs) / sizeof(msgs[0])));
-        for (int k = 0; k < tn; k++) {
-            midi_tx_send(msgs[k]);
-        }
 ```
 
-REVIEW, and this is the bug that would have shipped: `held` comes from `btn_update` as an out-parameter, not from a second call afterwards. The release clears the press timer, so asking for the duration after the update always returned zero, the `held >= BTN_MOMENTARY_MS` branch was unreachable, and a long hold on freeze would have *latched* it instead of releasing it. The unit tests passed anyway because they called the engine with an explicit duration and never exercised this ordering. `test_release_reports_the_real_press_duration` now pins it.
+No duration is threaded through, and there is no periodic tick. That is the whole benefit of the toggle decision: an earlier design timed the release to offer a momentary pedal, which needed the press duration handed across from `btn_update` (easy to get wrong: reading it afterwards returns zero, because the release has already cleared the timer, which silently made every hold behave as a tap) plus a timeout to rescue a release that never arrived. None of that exists now. Freeze advances on presses only.
 
 Queuing the whole burst at once is deliberate: the drain thread paces it on the wire, so the control loop stays at 5 ms even during a preset recall. This is the reason the queue exists.
 
@@ -2678,12 +2606,11 @@ Only one ladder button can be read at a time by construction, so simultaneous pr
 - [ ] **Step 3: Build, flash, and test at the rack**
 
 Expected, in this order:
-1. Tap track 1: freeze engages and stays on. Tap again: it releases.
-2. Press and hold track 1 for a second: freeze engages, and releases the moment the finger lifts.
-3. The boundary case: a press of roughly 400 ms. Either behaviour is acceptable there, but it must be one or the other, never both.
-4. Tap track 2 four times: shimmer steps through its four states and returns to the start.
-5. Tap track 3 or 4: nothing yet (no preset stored).
-6. No stuck freeze, ever. If a release is ever missed, freeze stays on and the session is ruined, so test this hard, including fast repeated taps and pressing two buttons at once.
+1. Press track 1: freeze engages. Press again: it releases. It should feel immediate, because it acts on the press.
+2. Hold track 1 down for several seconds and let go: **nothing happens on release**, freeze simply stays on. That is correct now, and it is the property that makes a lost release harmless.
+3. Press track 2 four times: shimmer steps through its four states and returns to the start.
+4. Press track 3 or 4 briefly: nothing yet (no preset stored).
+5. Hammer it: fast repeated presses, two buttons at once, presses during a fader sweep. Confirm the freeze LED and the audible state never disagree. A toggle that misses a press shows up here as an inverted state, and the fix is one more press, but you want to know how often it happens.
 
 - [ ] **Step 4: Commit**
 
@@ -3306,7 +3233,7 @@ String synth, puck on the desk, Push 3 pushed out of reach (the takeover policy 
 
 - [ ] **Step 2: Write down what actually happened**
 
-In `docs/session-log.md`: what worked, what felt wrong, what was reached for and not found, any stuck or missed message, whether fader resolution felt sufficient at 7 bits, whether the pickup behaviour after a recall felt natural or fiddly, and whether the 400 ms freeze threshold matched your hands. Be specific. Vague notes here waste the next session.
+In `docs/session-log.md`: what worked, what felt wrong, what was reached for and not found, any stuck or missed message, whether fader resolution felt sufficient at 7 bits, whether the pickup behaviour after a recall felt natural or fiddly, and **whether you reached for a momentary freeze stab and found only a toggle**. That last one is the specific thing the toggle decision traded away, so it is the specific thing to watch for. Be specific. Vague notes here waste the next session.
 
 - [ ] **Step 3: Make the call**
 
@@ -3360,6 +3287,7 @@ git push origin main --tags
 
 - **v1.1 WebSerial profile editor.** A browser page that rewrites the profile table over the CDC console: any CC, any channel, per control. Proven feasible on this hardware by the solderless flasher and by feldd's browser remapping. This is what makes the firmware genuinely generic rather than PopGoblin-shaped.
 - **MIDI clock output.** The transplanted TX already carries the code path; it needs a tempo source. Only worth it if the synth-side delay clock-sync work lands.
+- **Momentary freeze (press-and-lift) as a per-button option.** Traded away for v1 in favour of a plain toggle, because it made the release load-bearing. If the first session shows you reaching for sub-second stabs, it comes back as a third button mode rather than as the default, so the robust behaviour stays the one you get by accident.
 - **Function button as a shift layer** for a second CC bank, which would give palette cycling (CC 43) a home. YAGNI until v1 has been performed with.
 - **Renode emulation** via `softmodded/spire`, for firmware iteration without touching scarce hardware. Worth standing up only if hardware access becomes the bottleneck.
 
@@ -3368,5 +3296,5 @@ git push origin main --tags
 - **The TRS MIDI TX is not proven in writing, and the sync jack is undocumented.** Mitigated by Phase 0 preceding the bench, by Task 1.2 measuring source resistance and drive current before anything is connected to the Tiliqua, and by Task 1.3's decision tree.
 - **The pucks are unreleased prototypes.** Mitigated by developing on one, by the recovery drill in Task 1.1, and by the BIG FIVE constraints being restated at the top of `main.c`.
 - **Touch-fader jitter becoming CC zipper.** Mitigated by sizing the deadband from measured jitter in Task 2.2, by the coalescing queue, and by the synth's own CC smoothing. The idle-flicker check in Task 6.1 is the canary.
-- **A missed button release leaving freeze stuck on.** REVIEW correctly pointed out that debounce does nothing for a release that never arrives at all: it only rejects short disagreement. The real mitigations are the pedal timeout in `button_engine_tick` (a pedal held past `BTN_PEDAL_MAX_MS` is force-released), the bounded ADC-error run in `debounced_track_button`, and Task 5.2's fast-tap test. This remains the single most session-ruining failure mode in the design.
+- **~~A missed button release leaving freeze stuck on.~~ Designed out.** This was the single most session-ruining failure in the surface, and the toggle decision removes the mechanism rather than mitigating it: release is inert, so there is nothing for a lost release to strand. What remains is a much milder failure, a missed *press* leaving the puck's idea of freeze inverted from the synth's, which costs one extra press and re-syncs by itself. The bounded ADC-error run in `debounced_track_button` still matters, because a phantom press would toggle freeze spuriously.
 - **A recall being undone by the first fader nudge.** Mitigated by soft pickup (Task 7.2 Step 4) and made visible by the blinking LED (Task 6.1 Step 2).
