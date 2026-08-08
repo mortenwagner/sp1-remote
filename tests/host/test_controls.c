@@ -11,7 +11,7 @@ static void test_raw_to_cc_endpoints(void)
 
 static void test_raw_to_cc_midpoint(void)
 {
-    CHECK_EQ(fader_raw_to_cc(1850), 64);
+    CHECK_EQ(fader_raw_to_cc(FADER_RAW_FULL / 2), 64);
 }
 
 /* The puck must be silent at power-on: it has no idea what the synth is
@@ -51,20 +51,20 @@ static void test_jitter_inside_deadband_is_ignored(void)
     CHECK(!fader_update(&st, 996,  &v));
 }
 
-/* A 7-bit step spans about 29 raw counts and CC 34 covers raw 976 to 1005,
- * so a move of 20 counts inside that window clears the 8-count deadband and
- * still lands on the same CC. That is the only way to reach the duplicate
- * suppression branch: a smaller move is rejected by the deadband first and
- * never gets there. */
+/* A 7-bit step spans about 29 raw counts. At the measured full scale of
+ * 3730, CC 34 covers raw 984 to 1013, so a move of 20 counts inside that
+ * window clears the 12-count deadband and still lands on the same CC. That
+ * is the only way to reach the duplicate-suppression branch: a smaller move
+ * is rejected by the deadband first and never gets there. */
 static void test_same_cc_value_is_not_resent(void)
 {
     fader_state_t st = {0};
     uint8_t v = 0;
-    CHECK(!fader_update(&st, 970, &v));     /* seed */
-    CHECK(fader_update(&st, 980, &v));      /* emits CC 34 */
+    CHECK(!fader_update(&st, 975, &v));     /* seed, silent */
+    CHECK(fader_update(&st, 990, &v));      /* emits CC 34 */
     CHECK_EQ(v, 34);
-    CHECK_EQ(fader_raw_to_cc(1000), 34);    /* same bucket... */
-    CHECK(!fader_update(&st, 1000, &v));    /* ...so nothing is resent */
+    CHECK_EQ(fader_raw_to_cc(1010), 34);    /* same bucket... */
+    CHECK(!fader_update(&st, 1010, &v));    /* ...so nothing is resent */
 }
 
 /* --- soft pickup after a preset recall --- */

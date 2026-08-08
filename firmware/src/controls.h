@@ -6,8 +6,25 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define FADER_RAW_FULL          3700
-#define FADER_DEADBAND_RAW      8
+/* Full-scale raw code of a fader on the 12-bit SAADC as configured in
+ * app.overlay. MEASURED ON POP 2026-08-08 by sweeping all four strips:
+ * they reach 3742, 3735, 3735 and 3734. The looper's 3700 (main.c:7487)
+ * would clamp the top ~1% of every strip's travel to 127. 3730 sits just
+ * below the lowest observed maximum, so every fader can still reach 127. */
+#define FADER_RAW_FULL          3730
+/* Raw counts a fader must move past its last accepted position before a new
+ * value is considered.
+ *
+ * MEASURED ON POP: resting jitter is 4 to 7 counts peak-to-peak in a quiet
+ * window, and up to 23 over tens of seconds on a strip parked near its rail.
+ * That is far worse than the plus-or-minus 1 the looper's source claims, and
+ * it is why this is 12 rather than 8. One 7-bit step is about 29 counts, so
+ * 12 stays under half a step and costs no perceptible resolution.
+ *
+ * Note the deadband is not what prevents repeat sends (the duplicate-value
+ * check does that); it stops noise reaching the arithmetic at all. The
+ * acceptance test is Phase 4's: a puck left alone must emit nothing. */
+#define FADER_DEADBAND_RAW      12
 
 typedef struct {
     int      last_raw;

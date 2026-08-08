@@ -83,9 +83,15 @@ static int16_t  adc_sample;
  *  ADC
  * ====================================================================== */
 
-/* Oversampled ladder read, averaging 2 conversions (main.c:192-208).
- * A single 12-bit sample can land on a band boundary; averaging quietens
- * every ladder and the sticky debounce upstream does the rest.
+/* Oversampled ladder read (main.c:192-208, which averaged 2).
+ *
+ * Raised to 4 after measuring pop: resting jitter was 4 to 7 counts
+ * peak-to-peak, several times the plus-or-minus 1 the looper's comment
+ * claims. The looper capped this at 2 because its blocking ADC reads
+ * competed with an eMMC streamer and stole the margin a recording needed.
+ * This firmware has no audio and no storage engine, so the CPU is free:
+ * averaging 4 halves the noise for roughly 0.5 ms per control pass.
+ *
  * Returns -1 on error: callers treat <0 as "hold the last value". */
 static int ladder_read(const struct adc_dt_spec *spec)
 {
@@ -97,13 +103,13 @@ static int ladder_read(const struct adc_dt_spec *spec)
 		return -1;
 	}
 	int32_t acc = 0;
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < 4; i++) {
 		if (adc_read_dt(spec, &seq) < 0) {
 			return -1;
 		}
 		acc += adc_sample;
 	}
-	return (int)(acc / 2);
+	return (int)(acc / 4);
 }
 
 int board_io_read_fader(int idx)

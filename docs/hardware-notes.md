@@ -22,6 +22,67 @@ the eight known LEDs are four in a centre row and four above the track
 buttons, and at least some of them read as side-mounted from the front.
 Confirm which index is where during the survey.
 
+## Measured on pop, 2026-08-08 (Phase 2 skeleton, raw log in bench-2026-08-08-pop.txt)
+
+### Button ladder: every transplanted threshold confirmed
+
+| Control | Looper's comment | Measured on pop |
+|---|---|---|
+| Track 1 | ~213 | 216-224 |
+| Track 2 | ~403 | 405-415 |
+| Track 3 | ~733 | 740-747 |
+| Track 4 | ~1220 | 1226-1234 |
+| Play | ~1823 | 1830-1836 |
+| Track 1 + 4 combo | ~1325 | 1322-1329 |
+
+**The recovery combo does not collide with track 4.** An isolated track-4
+press peaks at 1234; the combo band starts at 1280. 46 counts of margin, and
+the combo lands mid-band. Holding track 4 alone can never reach DFU, and the
+combo can never be read as a track-4 press. This was the highest-severity
+finding of the second review pass, and it is now closed on hardware.
+
+### Faders: absolute position, and full scale is NOT 3700
+
+All four strips sweep 0 to their maximum under a finger, so they are true
+absolute-position sensors rather than relative gesture strips (the spec's
+open risk, closed).
+
+| | f0 | f1 | f2 | f3 |
+|---|---|---|---|---|
+| max | 3742 | 3735 | 3735 | 3734 |
+
+`FADER_RAW_FULL` is therefore **3730**, not the looper's 3700, which would
+have clamped the top ~1% of every strip's travel to 127. 3730 sits just below
+the lowest observed maximum so every fader can still reach 127.
+
+### Fader jitter is worse than the looper claims
+
+The looper's source says the ADC jitters plus-or-minus 1 count. Measured on
+pop: **4 to 7 counts peak-to-peak** in a quiet window, and **up to 23** over
+tens of seconds on a strip parked near its rail. One 7-bit MIDI step is about
+29 counts, so noise of that size can flap a fader resting on a bucket
+boundary between two CC values.
+
+Two responses, both applied:
+- `FADER_DEADBAND_RAW` raised from 8 to **12** (still under half a step).
+- ADC oversampling raised from 2 to **4** samples. The looper capped it at 2
+  because its blocking reads competed with an eMMC streamer; this firmware
+  has no audio or storage, so the CPU is free and averaging 4 halves the
+  noise for about 0.5 ms per control pass.
+
+The acceptance test is Phase 4's: a puck left alone must emit nothing.
+
+### LED placement
+
+`leds[0]` (P1.13) is the **top of the four side LEDs**. So what the looper's
+source calls the "centre row" is physically the vertical column on the side.
+
+### Escape hatch
+
+Track 1 + Track 4 held ~1.2 s from our running firmware reset pop into the
+bootloader, confirmed by the USB identity reverting to `stem player`. The
+hatch works.
+
 ## Sync jack
 
 Not yet measured; the multimeter work (Task 1.2) is deferred. What is known:
