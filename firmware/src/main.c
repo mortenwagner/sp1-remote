@@ -18,6 +18,8 @@
 #include <zephyr/kernel.h>
 #include "board_io.h"
 #include "midi_tx.h"
+#include "controls.h"
+#include "profile.h"
 
 #define SP1_DIAG 1
 
@@ -37,8 +39,12 @@
  * into a phantom press. */
 #define LADDER_ERR_LIMIT 10
 
+static fader_state_t g_fader[PROFILE_NUM_FADERS];
+
 int main(void)
 {
+	const profile_t *prof = &profile_popgoblin_default;
+
 	board_io_init();
 	midi_tx_init();
 
@@ -86,7 +92,7 @@ int main(void)
 
 #if SP1_DIAG
 		static int diag_div;
-		if (++diag_div >= 20) {                 /* every 100 ms */
+		if (++diag_div >= 40) {                 /* every 200 ms */
 			diag_div = 0;
 			printk("f0=%4d f1=%4d f2=%4d f3=%4d  lad=%4d btn=%d  "
 			       "batt=%4d usb=%d chg=%d\n",
@@ -99,20 +105,18 @@ int main(void)
 		}
 #endif
 
-#if SP1_DIAG
-		/* Phase 3 smoke test: sweep CC 102 (the synth's filter cutoff)
-		 * continuously, without touching anything. Proves the queue, the
-		 * drain thread and both sinks. Faders take over in Phase 4. */
-		static int ramp_div;
-		static int ramp_v, ramp_dir = 1;
-		if (++ramp_div >= 20) {                 /* every 100 ms */
-			ramp_div = 0;
-			ramp_v += ramp_dir * 4;
-			if (ramp_v >= 127) { ramp_v = 127; ramp_dir = -1; }
-			if (ramp_v <= 0)   { ramp_v = 0;   ramp_dir =  1; }
-			midi_tx_send((cc_msg_t){ 0, 102, (uint8_t)ramp_v });
+		/* ---- faders -> CC, through the coalescing queue ----
+		 * All four are read every pass. The looper round-robins them
+		 * only because its blocking ADC reads competed with an eMMC
+		 * streamer; nothing competes here. */
+		for (int i = 0; i < PROFILE_NUM_FADERS; i++) {
+			uint8_t v;
+
+			if (fader_update(&g_fader[i], board_io_read_fader(i), &v)) {
+				midi_tx_send((cc_msg_t){ prof->fader[i].channel,
+							 prof->fader[i].cc, v });
+			}
 		}
-#endif
 
 		k_msleep(CONTROL_PERIOD_MS);
 	}

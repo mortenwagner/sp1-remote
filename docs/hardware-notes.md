@@ -83,6 +83,31 @@ Track 1 + Track 4 held ~1.2 s from our running firmware reset pop into the
 bootloader, confirmed by the USB identity reverting to `stem player`. The
 hatch works.
 
+## USB MIDI verified on the Mac, 2026-08-08
+
+Pop enumerates as two CoreMIDI ports, `SP-1 Remote Block 1` (MIDI 1.0
+compatible) and `SP-1 Remote MIDI 2.0`, alongside the CDC console. The
+composite binds correctly.
+
+Listening on Block 1 while the Phase 3 smoke ramp ran:
+
+```
+ch1 CC 102 = 71, 67, 63, 59, 55, 51, 47, 43, 39, 35, 31, 27 ...
+CC102 values: min 0  max 127   rate 8.8/s
+```
+
+Channel, CC number, full 0-127 range, step size and rate all match what the
+firmware emits. That proves the coalescing queue, the drain thread, the USB
+sink and the composite device in one measurement.
+
+Reading it from the command line needs a little care: `receivemidi` is not in
+core Homebrew and its tap fails to build on this Xcode setup. What works is a
+throwaway venv with `python-rtmidi`, which sees every CoreMIDI port.
+
+**The TRS sink remains unverified.** It shares the same queue and the same
+pacing, so everything upstream of the two sinks is now proven; what is
+untested is only the bit-banged jack itself and the adapter it needs.
+
 ## Sync jack
 
 Not yet measured; the multimeter work (Task 1.2) is deferred. What is known:
