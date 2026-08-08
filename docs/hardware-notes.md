@@ -108,6 +108,52 @@ throwaway venv with `python-rtmidi`, which sees every CoreMIDI port.
 pacing, so everything upstream of the two sinks is now proven; what is
 untested is only the bit-banged jack itself and the adapter it needs.
 
+## Phase 4 verified end to end, 2026-08-08
+
+All four strips drive their profile CCs, measured on the Mac over USB MIDI:
+
+| CC | fader | msgs | range | channel |
+|---|---|---|---|---|
+| 102 | 1, cutoff | 101 | 0-127 | 1 |
+| 104 | 2, reverb wet | 87 | 0-127 | 1 |
+| 107 | 3, delay time | 98 | 0-127 | 1 |
+| 108 | 4, delay feedback | 101 | 0-127 | 1 |
+
+No missing CCs, none unexpected, peak 63 messages/s against a 200/s cap.
+
+### The strips LATCH their position
+
+Settled by direct test: fader 1 left at mid-travel read 2221 and held for
+20 seconds hands-off, drifting +2 counts. They are latching absolute-position
+sensors, not touch sensors that fall to zero on release. Our control model
+needs no touch detection.
+
+This was not obvious. Values genuinely do fall to near zero, but only because
+the BOTTOM of the strip reads 0-3, the same as an untouched strip that was
+last left at the bottom. A finger travelling down to the bottom and lifting
+looks identical to a decay, which is what sent me chasing a touch model that
+did not exist.
+
+Jitter at mid-travel, hands-off: 2218-2228, so 10 counts peak-to-peak. The
+deadband of 12 sits just above it, and 55 seconds of hands-off listening
+produced zero spurious MIDI messages.
+
+### Debugging note worth keeping
+
+An empty MIDI capture is NOT evidence that the firmware is silent. Several
+captures here returned nothing purely because they did not overlap with the
+sweeps, and each empty result invited a wrong theory. What settled it in one
+line was instrumenting the firmware itself with counters for messages pushed,
+drained, handed to USB, and whether the host had the interface open:
+
+```
+push=886 drain=886 usbtx=886 rdy=1
+```
+
+Four numbers advancing in lockstep proved the whole transmit path was healthy
+and moved the search to the listener, where the problem actually was.
+Instrument before theorising.
+
 ## Sync jack
 
 Not yet measured; the multimeter work (Task 1.2) is deferred. What is known:
