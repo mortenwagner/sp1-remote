@@ -125,6 +125,21 @@ int board_io_read_track_ladder(void)
 	return ladder_read(&adc_ladder[LAD_TRACKS]);
 }
 
+int board_io_read_battery(void)
+{
+	return ladder_read(&adc_ladder[LAD_BATT]);
+}
+
+bool board_io_usb_present(void)
+{
+	return (BQ_PORT->IN & (1u << BQ_NPGOOD_PIN)) == 0u;   /* low = present */
+}
+
+bool board_io_charging(void)
+{
+	return (BQ_PORT->IN & (1u << BQ_NCHG_PIN)) == 0u;     /* low = charging */
+}
+
 /* Transplanted from main.c:5098-5107. These thresholds are calibrated raw
  * values under the exact ADC configuration in the board files and
  * app.overlay: gain 1/6, 0.6 V internal reference, 20 us acquisition,

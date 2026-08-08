@@ -86,10 +86,14 @@ int main(void)
 		static int diag_div;
 		if (++diag_div >= 20) {                 /* every 100 ms */
 			diag_div = 0;
-			printk("f0=%4d f1=%4d f2=%4d f3=%4d  lad=%4d btn=%d\n",
+			printk("f0=%4d f1=%4d f2=%4d f3=%4d  lad=%4d btn=%d  "
+			       "batt=%4d usb=%d chg=%d\n",
 			       board_io_read_fader(0), board_io_read_fader(1),
 			       board_io_read_fader(2), board_io_read_fader(3),
-			       raw, board_io_decode_track_button(raw));
+			       raw, board_io_decode_track_button(raw),
+			       board_io_read_battery(),
+			       board_io_usb_present() ? 1 : 0,
+			       board_io_charging() ? 1 : 0);
 		}
 #endif
 

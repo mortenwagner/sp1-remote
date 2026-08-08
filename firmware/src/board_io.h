@@ -36,6 +36,15 @@ int  board_io_decode_track_button(int raw);
 
 bool board_io_function_held(void);
 
+/* Charger telemetry, straight off the BQ24232's open-drain status pins.
+ * Both are active LOW at the pin; these return the logical sense. */
+bool board_io_usb_present(void);   /* nPGOOD low: bus power is there   */
+bool board_io_charging(void);      /* nCHG   low: actively charging    */
+
+/* Raw battery voltage from the on-board divider (AIN4). Relative only:
+ * useful for watching it climb, not for a state-of-charge percentage. */
+int  board_io_read_battery(void);
+
 /* SYSTEM_OFF. Never returns. Clears RESETREAS first, and leaves the power
  * button armed as the wake source, so the bootloader gets control on the
  * next press. */
