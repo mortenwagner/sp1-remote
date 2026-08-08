@@ -72,6 +72,7 @@
 <body>
 <header>
   <h1>SP-1 Remote</h1>
+  <span class="sub" id="ver">build 2</span>
   <span class="sub"><span id="dot"></span><span id="state">not connected</span></span>
   <button id="connect">connect</button>
   <span class="sub" id="rate"></span>
@@ -294,10 +295,16 @@ $('connect').addEventListener('click', async () => {
   reader = dec.readable.getReader();
   writer = port.writable.getWriter();
 
-  /* Deliberately NOT sending {"t":"quiet"}: the diagnostic stream is what
-   * drives the fader bars and the counters, and the read loop already tells
-   * JSON replies from diagnostics by their leading brace. Silencing it was
-   * a bug that froze the live view the moment the editor connected. */
+  /* Explicitly turn the diagnostic stream ON. It is what drives the fader
+   * bars and the counters, and the read loop tells JSON replies from
+   * diagnostics by their leading brace, so there is never a reason to
+   * silence it here.
+   *
+   * Sending quiet:0 rather than simply not sending quiet:1 is deliberate:
+   * the flag lives in the puck's RAM, so it can be left set by an earlier
+   * session (an older build of this page, or a hand-driven terminal). This
+   * makes connecting self-healing instead of inheriting a dead panel. */
+  await send({ t: 'quiet', on: 0 });
   await send({ t: 'prof' });
   wireEditor();
 
