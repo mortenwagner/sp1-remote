@@ -171,6 +171,37 @@ original {0, 42, 85, 127} would have had Off and Boost swapped.
 
 No unexpected CCs in 330 messages.
 
+## Editable profile proven, 2026-08-08
+
+The JSON console and the profile store, verified by speaking the protocol
+from Python (browser out of the picture):
+
+```
+{"t":"prof"}                      -> the full surface, one object per control
+{"t":"set","f":0,"cc":20,"ch":2}  -> {"t":"ok"}
+{"t":"save"}                      -> {"t":"ok","saved":1}
+   ... power cycle ...
+{"t":"prof"}                      -> {"t":"f_r","i":0,"cc":20,"ch":2}
+```
+
+The edit survived a power cycle and everything else came back at its
+default, so the record encodes and reloads correctly. Validation works too:
+CC 200 gives `{"t":"err","why":"range"}` and fader index 9 gives
+`{"t":"err","why":"index"}` rather than being silently accepted. `default`
+then `save` restored CC 102.
+
+### The bug this found
+
+The first version received NOTHING. Zephyr's CDC ACM only queues its first
+USB OUT transfer when interrupt RX is enabled (usbd_cdc_acm.c:759), and a
+`uart_poll_in()` loop never kicks that, so the ring it polls stays empty
+forever while the device happily keeps transmitting diagnostics. It looks
+exactly like a browser bug and is not one.
+
+Method worth repeating: driving the protocol from Python instead of the
+browser isolated firmware-versus-page in one step. Same lesson as the
+transmit counters earlier: make the thing observable before theorising.
+
 ## Presets work, 2026-08-08
 
 Hold-to-save writes and confirms with the three fast blinks, and the scene
