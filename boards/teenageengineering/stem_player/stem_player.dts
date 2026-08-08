@@ -1,0 +1,167 @@
+/*
+ * Teenage Engineering SP-1 board definition for sp1-remote.
+ *
+ * Vendored from chattock/sp1-tape-looper (MIT), which in turn reconstructed
+ * it from ericlewis/sp1-midi's stem_player board (MIT), timknapen's
+ * SP-1-dev pin map, and hardware tracing. Chosen over sp1-midi's own board
+ * files for two reasons, decided at the Task 2.1 gate on 2026-08-08:
+ *
+ *   1. The transplanted driver code in firmware/src/board_io.c and this
+ *      board definition are a matched pair. That code addresses the ADC by
+ *      zephyr_user io-channel INDEX and drives the LEDs as raw GPIO.
+ *      sp1-midi's board instead exposes named nodes, adc-keys and PWM LEDs,
+ *      so pairing them would mean rewriting the glue around code whose whole
+ *      value is that it is already verified on hardware.
+ *   2. These exact files, on this exact toolchain, reproduce the looper's
+ *      shipped binary byte for byte (see docs/toolchain.md). Nothing else
+ *      available is proven to that standard.
+ *
+ * Differences from the sp1-midi board, inherited and deliberate:
+ *  - No PWM LED nodes: both LED rows are driven as raw GPIO by a soft-PWM
+ *    renderer, and a PWM peripheral owning those pins would fight it.
+ *  - uart0 disabled: P1.01-P1.04 belong to the CYBT Bluetooth module, which
+ *    this firmware never touches; driving TX risks contention.
+ *  - I2S pins are slave-direction (see the pinctrl file).
+ *  - ADC channels 0-1 (the button ladders) are configured EXACTLY like the
+ *    fader channels in firmware/app.overlay (gain 1/6, 0.6 V internal
+ *    reference, 20 us acquisition, 12-bit). board_io.c's decode thresholds
+ *    are calibrated raw values under this configuration: changing one
+ *    without re-measuring the other silently breaks button decoding.
+ *
+ * Difference from the looper, ours:
+ *  - The UAC2 USB-audio nodes are removed. This firmware has no audio path,
+ *    which is also why it needs no patched Zephyr tree.
+ */
+
+/dts-v1/;
+#include <nordic/nrf52840_qiaa.dtsi>
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
+#include "stem_player-pinctrl.dtsi"
+
+/ {
+	model = "Stem Player SP-1";
+	compatible = "teenageengineering,stem-player";
+
+	/* P0.09/P0.10 are NFC pins by default; SP-1 uses them as GPIO
+	 * (P0.09 = TAS2505 reset, P0.10 = BT module reset). */
+	nfct-pins-as-gpios;
+
+	/* The app's overlay (firmware/app.overlay) extends this by label to
+	 * publish the ADC channel list main.c consumes by index. */
+	zephyr_user: zephyr,user {
+	};
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+		zephyr,console = &cdc_acm_uart0;
+	};
+
+	aliases {
+		/* main.c: DT_ALIAS(watchdog0) — the app feeds the WDT the
+		 * bootloader arms (a "BIG FIVE" requirement). */
+		watchdog0 = &wdt0;
+	};
+
+
+
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	/* Button ladder 1: tracks 1-4 + PLAY (P0.02/AIN0). */
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
+		zephyr,input-positive = <NRF_SAADC_AIN0>;
+		zephyr,resolution = <12>;
+	};
+
+	/* Button ladder 2: Vol +/- and FWD/RWD rocker (P0.03/AIN1). */
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
+		zephyr,input-positive = <NRF_SAADC_AIN1>;
+		zephyr,resolution = <12>;
+	};
+
+	/* Channels 2-6 (faders + battery) are defined by the app's
+	 * firmware/app.overlay, matching the original repo split. */
+};
+
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	/* CS42L42 (0x48) and TAS2505 (0x18) are addressed directly from
+	 * main.c; no DT child nodes needed. */
+};
+
+&i2s0 {
+	status = "okay";
+	pinctrl-0 = <&i2s0_default>;
+	pinctrl-1 = <&i2s0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+zephyr_udc0: &usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "okay";
+
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+/* CYBT-353027 Bluetooth module UART — unused by the looper; kept off so
+ * nothing drives the module's lines. */
+&uart0 {
+	status = "disabled";
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* TE bootloader lives below 0x20000; it loads the app at
+		 * 0x20000, max size 0xDF000 (SP-1-dev wiki: Bootloader). */
+		boot_partition: partition@0 {
+			label = "bootloader";
+			reg = <0x00000000 0x00020000>;
+		};
+
+		slot0_partition: partition@20000 {
+			label = "image-0";
+			reg = <0x00020000 0x000df000>;
+		};
+
+		storage_partition: partition@ff000 {
+			label = "storage";
+			reg = <0x000ff000 0x00001000>;
+		};
+	};
+};
