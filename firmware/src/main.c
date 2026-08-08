@@ -17,6 +17,7 @@
 
 #include <zephyr/kernel.h>
 #include "board_io.h"
+#include "midi_tx.h"
 
 #define SP1_DIAG 1
 
@@ -39,6 +40,7 @@
 int main(void)
 {
 	board_io_init();
+	midi_tx_init();
 
 	uint32_t held_ms   = 0;
 	int64_t  combo14_t = -1;
@@ -94,6 +96,21 @@ int main(void)
 			       board_io_read_battery(),
 			       board_io_usb_present() ? 1 : 0,
 			       board_io_charging() ? 1 : 0);
+		}
+#endif
+
+#if SP1_DIAG
+		/* Phase 3 smoke test: sweep CC 102 (the synth's filter cutoff)
+		 * continuously, without touching anything. Proves the queue, the
+		 * drain thread and both sinks. Faders take over in Phase 4. */
+		static int ramp_div;
+		static int ramp_v, ramp_dir = 1;
+		if (++ramp_div >= 20) {                 /* every 100 ms */
+			ramp_div = 0;
+			ramp_v += ramp_dir * 4;
+			if (ramp_v >= 127) { ramp_v = 127; ramp_dir = -1; }
+			if (ramp_v <= 0)   { ramp_v = 0;   ramp_dir =  1; }
+			midi_tx_send((cc_msg_t){ 0, 102, (uint8_t)ramp_v });
 		}
 #endif
 

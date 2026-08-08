@@ -16,4 +16,7 @@ target_sources(app PRIVATE
   src/profile.c
   src/txqueue.c
   src/presets.c
+  src/midi_tx.c
+  src/midi_trs.c
+  src/midi_usb.c
 )
