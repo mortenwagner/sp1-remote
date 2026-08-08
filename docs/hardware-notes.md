@@ -173,10 +173,14 @@ No unexpected CCs in 330 messages.
 
 ## Presets work, 2026-08-08
 
-Hold-to-save on a track button writes and confirms with the three fast
-blinks. This is also the first successful write to the relocated storage
-region at 0xF7000, which validates moving off the bootloader settings page
-at 0xFF000 (where the gate had correctly refused).
+Hold-to-save writes and confirms with the three fast blinks, and the scene
+**survives a power cycle** and recalls correctly. Save, persist and recall
+all proven, so this is real flash storage rather than a RAM copy that
+happens to still be there.
+
+It is also the first successful write to the relocated storage region at
+0xF7000, which validates moving off the bootloader settings page at
+0xFF000, where the safety gate had correctly refused.
 
 ## TRS MIDI PROVEN, 2026-08-08
 

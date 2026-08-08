@@ -22,8 +22,8 @@ USB MIDI controller.
 | 3 | transmit path | done; USB MIDI verified live on the Mac |
 | 4 | faders | done and verified: all four drive CC 102/104/107/108 across 0-127 |
 | 5 | buttons | done and verified: freeze toggles cleanly, shimmer steps the synth's enum |
-| 6 | LEDs | done, not yet eyeballed |
-| 7 | presets | written, not yet exercised on hardware |
+| 6 | LEDs | done |
+| 7 | presets | done and verified: save, persist across a power cycle, recall |
 
 **The whole signal chain is now proven on hardware**, including TRS MIDI
 out, which needs only an ordinary 3.5 mm cable: data is on the tip (P0.20,
