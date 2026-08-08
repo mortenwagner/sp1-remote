@@ -426,7 +426,10 @@ So the practical order when the meter and iron are not to hand is:
 
 The only thing this ordering defers is driving the actual string synth, since popgoblin has no USB MIDI host. Everything else gets built and proven first.
 
-### Task 1.1: Flash and recovery drill on the dev puck
+### Task 1.1: Flash and recovery drill on the dev puck — DONE 2026-08-08, PASSED
+
+Executed on pop. Results and the two gotchas that look like failure are in `docs/flashing.md`. Summary: bootloader entry from stock, looper flashed, and bootloader re-entry from running custom firmware, all confirmed. The second flash-and-re-enter cycle below was skipped deliberately: flashing always happens in bootloader mode, where the bootloader erases and rewrites the app slot, so whether the previous occupant was stock or custom does not change the operation. Steps kept below for the next puck.
+
 
 **Files:**
 - Create: `docs/flashing.md`
@@ -460,7 +463,9 @@ Open **firmware utility**, select `refs/sp1-tape-looper/sp1_looper.bin`, connect
 
 Re-enter bootloader mode from the running looper firmware (power off, Track 1 + Track 4, plug in). Flash the shipped `refs/sp1-tape-looper/sp1_looper.bin` this time. Then do it once more with your own build. Two successful re-entries with a custom image already resident is the actual thing being tested: that a running app cannot lock you out.
 
-**STOP RULE:** if bootloader mode cannot be re-entered from a running custom firmware, stop the project here and report. Do not write firmware for a device you cannot recover.
+**STOP RULE:** if bootloader mode cannot be re-entered from a running custom firmware, stop the project here and report. Do not write firmware for a device you cannot recover. (Cleared on pop, 2026-08-08.)
+
+**Before diagnosing a failure here, check the USB identity rather than the page.** `ioreg -p IOUSB -l -w 0 | grep kUSBProductString | grep -i "stem\|SP-1"` reports `stem player` for the bootloader and `SP-1 Audio` for the looper. The serial port changes with the mode and the flasher keeps holding the old one, so a successful recovery reads as `device mode: unknown (...)` until the page is reloaded and reconnected. That is not a failed recovery, and it cost us a scare.
 
 - [ ] **Step 6: Write `docs/flashing.md`**
 
