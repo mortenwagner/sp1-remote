@@ -171,6 +171,13 @@ original {0, 42, 85, 127} would have had Off and Boost swapped.
 
 No unexpected CCs in 330 messages.
 
+## Presets work, 2026-08-08
+
+Hold-to-save on a track button writes and confirms with the three fast
+blinks. This is also the first successful write to the relocated storage
+region at 0xF7000, which validates moving off the bootloader settings page
+at 0xFF000 (where the gate had correctly refused).
+
 ## TRS MIDI PROVEN, 2026-08-08
 
 With the UARTE rewrite (data on the TIP, P0.20, Type A) and an **ordinary
