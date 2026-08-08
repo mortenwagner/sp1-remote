@@ -95,13 +95,16 @@ int main(void)
 		if (++diag_div >= 40) {                 /* every 200 ms */
 			diag_div = 0;
 			printk("f0=%4d f1=%4d f2=%4d f3=%4d  lad=%4d btn=%d  "
-			       "batt=%4d usb=%d chg=%d\n",
+			       "batt=%4d usb=%d chg=%d  "
+			       "push=%u drain=%u usbtx=%u rdy=%d\n",
 			       board_io_read_fader(0), board_io_read_fader(1),
 			       board_io_read_fader(2), board_io_read_fader(3),
 			       raw, board_io_decode_track_button(raw),
 			       board_io_read_battery(),
 			       board_io_usb_present() ? 1 : 0,
-			       board_io_charging() ? 1 : 0);
+			       board_io_charging() ? 1 : 0,
+			       midi_tx_pushed(), midi_tx_drained(),
+			       midi_tx_usb_sent(), midi_tx_usb_ready() ? 1 : 0);
 		}
 #endif
 

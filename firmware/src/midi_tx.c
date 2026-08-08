@@ -4,6 +4,8 @@
 #include "midi_trs.h"
 #include "midi_usb.h"
 
+static uint32_t n_pushed, n_drained, n_usb;
+
 #define MIDI_TX_STACK 640
 #define MIDI_TX_PRIO  7          /* preemptible: a burst must never starve
                                   * the control loop or the watchdog feed */
@@ -31,6 +33,7 @@ void midi_tx_send(cc_msg_t m)
 	k_mutex_unlock(&tx_lock);
 
 	if (ok) {
+		n_pushed++;
 		k_sem_give(&tx_wake);
 	}
 	/* A rejected push means 16 distinct (channel, cc) pairs are already
@@ -56,7 +59,11 @@ static void midi_tx_thread(void *a, void *b, void *c)
 			continue;
 		}
 
+		n_drained++;
 		midi_trs_send_cc(m.channel, m.cc, m.value);
+		if (midi_usb_ready()) {
+			n_usb++;
+		}
 		midi_usb_send_cc(m.channel, m.cc, m.value);
 		k_msleep(MIDI_TX_SPACING_MS);
 	}
@@ -75,3 +82,8 @@ void midi_tx_init(void)
 			NULL, NULL, NULL, MIDI_TX_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_tcb, "midi_tx");
 }
+
+uint32_t midi_tx_pushed(void)  { return n_pushed; }
+uint32_t midi_tx_drained(void) { return n_drained; }
+uint32_t midi_tx_usb_sent(void){ return n_usb; }
+bool     midi_tx_usb_ready(void) { return midi_usb_ready(); }
