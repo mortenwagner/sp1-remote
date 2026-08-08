@@ -46,6 +46,20 @@ int  preset_page_find_latest(const uint8_t *page, uint32_t page_len,
 /* Byte offset of the next writable slot, or -1 when the page is full. */
 int  preset_page_next_offset(const uint8_t *page, uint32_t page_len);
 
+/* ---- profile records ----
+ * The runtime-editable control surface, stored in its OWN page of the 32 KB
+ * storage region, so it never shares an erase unit with presets.
+ * Magic 'S','C' distinguishes it from a preset record's 'S','P'. */
+#define PROFILE_REC_SIZE  144
+#define PROFILE_MAGIC_0   0x53   /* 'S' */
+#define PROFILE_MAGIC_1   0x43   /* 'C' */
+#define PROFILE_REC_VER   1
+
+void profile_record_encode(const profile_t *prof, uint8_t rec[PROFILE_REC_SIZE]);
+bool profile_record_decode(const uint8_t rec[PROFILE_REC_SIZE], profile_t *out);
+int  profile_page_find_latest(const uint8_t *page, uint32_t page_len, profile_t *out);
+int  profile_page_next_offset(const uint8_t *page, uint32_t page_len);
+
 /* ---- Zephyr-only half, implemented in presets_flash.c ----
  * Excluded from the host tests: everything above this line is pure. */
 bool preset_store_is_safe(void);   /* is the page ours to write? */
@@ -53,5 +67,11 @@ bool preset_store_load(preset_bank_t *out);
 bool preset_store_save(const preset_bank_t *bank);
 void preset_store_dump(void);      /* Task 7.0, read only */
 bool preset_store_repair(void);    /* erase the page; human-triggered only */
+
+/* Profile store, page 1 of the storage region. Seed *out with the compiled
+ * default before loading: a stored record overrides the mapping only. */
+bool profile_store_load(profile_t *out);
+bool profile_store_save(const profile_t *prof);
+bool profile_store_erase(void);    /* back to the compiled default */
 
 #endif /* SP1_PRESETS_H */

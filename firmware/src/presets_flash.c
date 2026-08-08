@@ -33,6 +33,11 @@
  * declares it read-only so nothing can claim it by accident. */
 #define PAGE_LEN     4096
 
+/* The 32 KB region is divided by page so the two stores never share an
+ * erase unit: presets in page 0, the editable profile in page 1. The
+ * remaining 24 KB is spare. */
+#define PROFILE_OFF  4096
+
 static uint8_t page_buf[PAGE_LEN];
 
 static int page_read(void)
@@ -214,5 +219,78 @@ bool preset_store_repair(void)
 	ok = (flash_area_erase(fa, 0, PAGE_LEN) == 0);
 	flash_area_close(fa);
 	printk("preset: page erase %s\n", ok ? "OK" : "FAILED");
+	return ok;
+}
+
+/* ---- profile store, page 1 of the region ---- */
+
+static uint8_t prof_buf[PAGE_LEN];
+
+static int prof_page_read(void)
+{
+	const struct flash_area *fa;
+	int rc;
+
+	if (flash_area_open(STORAGE_ID, &fa) != 0) {
+		return -1;
+	}
+	rc = flash_area_read(fa, PROFILE_OFF, prof_buf, PAGE_LEN);
+	flash_area_close(fa);
+	return rc;
+}
+
+/* Seed *out with the compiled default before calling: a stored record only
+ * overrides the mapping, never the build's capture list. */
+bool profile_store_load(profile_t *out)
+{
+	if (prof_page_read() != 0) {
+		return false;
+	}
+	return profile_page_find_latest(prof_buf, PAGE_LEN, out) >= 0;
+}
+
+bool profile_store_save(const profile_t *prof)
+{
+	const struct flash_area *fa;
+	bool ok = false;
+
+	if (prof_page_read() != 0) {
+		return false;
+	}
+
+	int off = profile_page_next_offset(prof_buf, PAGE_LEN);
+
+	if (flash_area_open(STORAGE_ID, &fa) != 0) {
+		return false;
+	}
+	if (off < 0) {
+		/* 28 records per page. Erasing only this page cannot touch the
+		 * presets in page 0, and the compiled default is always the
+		 * fallback, so losing the stored mapping is never fatal. */
+		if (flash_area_erase(fa, PROFILE_OFF, PAGE_LEN) == 0) {
+			off = 0;
+		}
+	}
+	if (off >= 0) {
+		uint8_t rec[PROFILE_REC_SIZE];
+
+		profile_record_encode(prof, rec);
+		ok = (flash_area_write(fa, (off_t)(PROFILE_OFF + off), rec,
+				       sizeof(rec)) == 0);
+	}
+	flash_area_close(fa);
+	return ok;
+}
+
+bool profile_store_erase(void)
+{
+	const struct flash_area *fa;
+	bool ok;
+
+	if (flash_area_open(STORAGE_ID, &fa) != 0) {
+		return false;
+	}
+	ok = (flash_area_erase(fa, PROFILE_OFF, PAGE_LEN) == 0);
+	flash_area_close(fa);
 	return ok;
 }

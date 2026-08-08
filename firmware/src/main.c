@@ -42,6 +42,7 @@
  * into a phantom press. */
 #define LADDER_ERR_LIMIT 10
 
+profile_t              g_profile;      /* the live, editable mapping */
 static fader_state_t   g_fader[PROFILE_NUM_FADERS];
 static btn_state_t     g_btn[PROFILE_NUM_BUTTONS];
 static button_engine_t g_eng;
@@ -197,7 +198,14 @@ static int debounced_track_button(void)
 
 int main(void)
 {
-	const profile_t *prof = &profile_popgoblin_default;
+	/* The live profile is a RAM copy, so it can be edited over the console
+	 * and persisted. The compiled-in table is always the fallback: if flash
+	 * holds nothing valid, or a stored record is rejected, the puck comes
+	 * up with the shipped mapping rather than nothing. */
+	g_profile = profile_popgoblin_default;
+	(void)profile_store_load(&g_profile);
+
+	const profile_t *prof = &g_profile;
 
 	board_io_init();
 	midi_tx_init();
