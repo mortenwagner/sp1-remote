@@ -294,9 +294,10 @@ $('connect').addEventListener('click', async () => {
   reader = dec.readable.getReader();
   writer = port.writable.getWriter();
 
-  /* Silence the diagnostic stream so JSON replies are not buried, then read
-   * the current mapping. */
-  await send({ t: 'quiet', on: 1 });
+  /* Deliberately NOT sending {"t":"quiet"}: the diagnostic stream is what
+   * drives the fader bars and the counters, and the read loop already tells
+   * JSON replies from diagnostics by their leading brace. Silencing it was
+   * a bug that froze the live view the moment the editor connected. */
   await send({ t: 'prof' });
   wireEditor();
 

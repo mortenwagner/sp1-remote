@@ -51,9 +51,10 @@ command applied. It is plain enough to drive by hand:
 
 Channels are 0-15 on the wire and shown 1-16 in the page, as musicians count.
 
-The editor silences the diagnostic stream on connect, so if you have `screen`
-open at the same time you will see the puck go quiet. That is the `quiet`
-command, not a hang.
+The page does not send `quiet`, even though the protocol offers it: the
+diagnostic stream is what drives the fader bars and the counters, and the
+read loop separates JSON replies from diagnostics by their leading brace.
+Sending it froze the live view the moment the editor connected.
 
 ## Parked: what the editor does not do yet
 
