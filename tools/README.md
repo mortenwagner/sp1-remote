@@ -29,18 +29,43 @@ opened the MIDI interface so USB sends are being dropped. Working that out
 from an empty MIDI capture took far longer than reading it off this page
 would have.
 
-## Parked: the profile editor
+## The mapping editor (in monitor.html)
+
+Live now. Connect, and the bottom section reads the puck's current mapping
+and lets you change any control's CC and channel. Edits apply immediately in
+RAM; **save to flash** persists them, **defaults** restores the shipped
+mapping in RAM only so nothing is lost until you save.
+
+The wire protocol is JSON lines over the same CDC console, shaped after
+feldd's: one object per line each way, replies always `{"t":"ok"}`,
+`{"t":"err"}` or a `_r` response, so the page never has to guess whether a
+command applied. It is plain enough to drive by hand:
+
+```
+{"t":"prof"}                      read the mapping
+{"t":"set","f":0,"cc":20,"ch":1}  fader 0 -> CC 20, channel 2 on the wire
+{"t":"save"}                      persist
+{"t":"default"}                   back to the compiled mapping (RAM only)
+{"t":"quiet","on":1}              stop the diagnostic stream
+```
+
+Channels are 0-15 on the wire and shown 1-16 in the page, as musicians count.
+
+The editor silences the diagnostic stream on connect, so if you have `screen`
+open at the same time you will see the puck go quiet. That is the `quiet`
+command, not a hang.
+
+## Parked: what the editor does not do yet
 
 The v1.1 plan is a browser editor for the control surface: any CC, any
 channel, per control, written over WebSerial. This page is deliberately
 the same plumbing, so the editor becomes a tab here rather than a new
 thing.
 
-It is blocked on storage, not on the UI. `profile_popgoblin_default` is
-`const`, compiled into the app image that the flasher overwrites, so a
-runtime-editable profile has to live in the 4 KB page at `0xFF000` that
-now holds presets. That needs a shared layout (a second record type in the
-same append-log, latest wins), and it depends on that page being ours,
-which `preset_store_is_safe()` and the PLAY dump exist to establish.
+Button MODE is read-only in the page: you can retarget a button's CC and
+channel, but not turn a toggle into a cycle, or edit a cycle's step values
+or a list's contents. The firmware's profile record already stores all of
+it, so this is a UI gap rather than a firmware one.
 
-Settle the storage question first, then this becomes straightforward.
+Nor does it do feldd's larger ideas: multiple profiles, layers, keyboard
+output, or naming controls. Those are worth stealing if this gets used.

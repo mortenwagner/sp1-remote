@@ -20,4 +20,5 @@ target_sources(app PRIVATE
   src/midi_tx.c
   src/midi_trs.c
   src/midi_usb.c
+  src/config_console.c
 )

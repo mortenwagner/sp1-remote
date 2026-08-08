@@ -23,6 +23,7 @@
 #include "profile.h"
 #include "buttons.h"
 #include "presets.h"
+#include "config_console.h"
 
 #define SP1_DIAG 1
 
@@ -229,6 +230,7 @@ int main(void)
 
 	for (;;) {
 		board_io_feed_wdt();
+		config_console_poll();
 
 		int pressed = debounced_track_button();
 
@@ -305,7 +307,7 @@ int main(void)
 
 #if SP1_DIAG
 		static int diag_div;
-		if (++diag_div >= 40) {                 /* every 200 ms */
+		if (!g_diag_quiet && ++diag_div >= 40) {                 /* every 200 ms */
 			diag_div = 0;
 			printk("f0=%4d f1=%4d f2=%4d f3=%4d  lad=%4d btn=%d  "
 			       "batt=%4d usb=%d chg=%d  "

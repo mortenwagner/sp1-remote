@@ -56,6 +56,17 @@
          white-space:pre-wrap; }
   .hint { color:var(--dim); font-size:12px; margin:0; }
   code { background:var(--track); padding:1px 5px; border-radius:4px; }
+  .grid-edit { display:grid; gap:10px;
+               grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); }
+  .ctl { background:var(--track); border-radius:8px; padding:11px 13px; }
+  .ctl h3 { margin:0 0 9px; font-size:12px; font-weight:600; }
+  .ctl .who { color:var(--dim); font-weight:400; }
+  .fld { display:flex; align-items:center; gap:8px; margin-top:6px; }
+  .fld label { color:var(--dim); font-size:11px; width:56px; }
+  input[type=number] { font:inherit; width:74px; padding:4px 7px; border-radius:6px;
+                       border:1px solid var(--line); background:var(--panel);
+                       color:var(--ink); }
+  input[type=number]:focus { outline:1px solid var(--accent); border-color:var(--accent); }
 </style>
 </head>
 <body>
@@ -106,6 +117,22 @@
   </section>
 
   <section style="grid-column:1/-1">
+    <h2>Mapping</h2>
+    <p class="hint" style="margin:0 0 14px">
+      Edits apply immediately and live in RAM. <b>Save</b> writes them to the
+      puck's flash so they survive a power cycle; <b>Defaults</b> restores the
+      shipped mapping in RAM only, so nothing is lost until you save.
+    </p>
+    <div id="editor" class="grid-edit"></div>
+    <div style="display:flex; gap:10px; margin-top:16px; flex-wrap:wrap">
+      <button id="read">read from puck</button>
+      <button id="save">save to flash</button>
+      <button id="defaults">defaults</button>
+      <span class="sub" id="editstate"></span>
+    </div>
+  </section>
+
+  <section style="grid-column:1/-1">
     <h2>Console</h2>
     <div id="log"></div>
   </section>
@@ -133,7 +160,80 @@ for (let i = 0; i < 5; i++) {
     `<div class="btn" id="b${i}">${i === 4 ? 'PLAY' : 'T' + (i + 1)}<small>${BTNNAME[i]}</small></div>`);
 }
 
-let port, reader, lines = 0, t0 = Date.now();
+let port, reader, writer, lines = 0, t0 = Date.now();
+
+/* ---- editor ---------------------------------------------------------- */
+const FNAME = ['fader 1', 'fader 2', 'fader 3', 'fader 4'];
+const BNAME = ['track 1', 'track 2', 'track 3', 'track 4'];
+const MODE  = ['toggle', 'cycle', 'preset', 'list'];
+
+function ctlCard(kind, i, name, sub) {
+  return `<div class="ctl">
+      <h3>${name} <span class="who">${sub}</span></h3>
+      <div class="fld"><label>CC</label>
+        <input type="number" min="0" max="127" id="${kind}${i}cc" disabled></div>
+      <div class="fld"><label>channel</label>
+        <input type="number" min="1" max="16" id="${kind}${i}ch" disabled></div>
+    </div>`;
+}
+{
+  let h = '';
+  for (let i = 0; i < 4; i++) h += ctlCard('f', i, FNAME[i], CCNAME[i]);
+  for (let i = 0; i < 4; i++) h += ctlCard('b', i, BNAME[i], BTNNAME[i]);
+  $('editor').innerHTML = h;
+}
+
+async function send(obj) {
+  if (!writer) return;
+  await writer.write(new TextEncoder().encode(JSON.stringify(obj) + '\n'));
+}
+
+function wireEditor() {
+  for (const kind of ['f', 'b']) {
+    for (let i = 0; i < 4; i++) {
+      for (const field of ['cc', 'ch']) {
+        const el = $(kind + i + field);
+        el.disabled = false;
+        el.addEventListener('change', async () => {
+          let v = parseInt(el.value, 10);
+          if (isNaN(v)) return;
+          /* The wire uses 0-15 for channel; humans count from 1. */
+          const msg = { t: 'set' };
+          msg[kind] = i;
+          msg[field] = field === 'ch' ? v - 1 : v;
+          await send(msg);
+          $('editstate').textContent = 'edited, not saved';
+        });
+      }
+    }
+  }
+  $('read').addEventListener('click', () => send({ t: 'prof' }));
+  $('save').addEventListener('click', async () => {
+    await send({ t: 'save' });
+  });
+  $('defaults').addEventListener('click', async () => {
+    await send({ t: 'default' });
+    await send({ t: 'prof' });
+  });
+}
+
+/* Replies are JSON objects, one per line. */
+function onJson(o) {
+  if (o.t === 'f_r' || o.t === 'b_r') {
+    const k = o.t[0];
+    $(k + o.i + 'cc').value = o.cc;
+    $(k + o.i + 'ch').value = o.ch + 1;
+    if (o.t === 'b_r' && MODE[o.mode]) {
+      const card = $(k + o.i + 'cc').closest('.ctl').querySelector('.who');
+      card.textContent = BTNNAME[o.i] + ' \u00b7 ' + MODE[o.mode];
+    }
+  } else if (o.t === 'ok') {
+    if (o.saved) $('editstate').textContent = 'saved to flash';
+    else if (o.default) $('editstate').textContent = 'defaults restored (not saved)';
+  } else if (o.t === 'err') {
+    $('editstate').textContent = 'error: ' + (o.why || 'save failed');
+  }
+}
 
 /* The firmware's diagnostic line, e.g.
    f0= 123 f1= 456 f2= 789 f3=1012  lad=   5 btn=-1  batt=2393 usb=1 chg=1  push=886 drain=886 usbtx=886 rdy=1 */
@@ -192,6 +292,13 @@ $('connect').addEventListener('click', async () => {
   const dec = new TextDecoderStream();
   port.readable.pipeTo(dec.writable);
   reader = dec.readable.getReader();
+  writer = port.writable.getWriter();
+
+  /* Silence the diagnostic stream so JSON replies are not buried, then read
+   * the current mapping. */
+  await send({ t: 'quiet', on: 1 });
+  await send({ t: 'prof' });
+  wireEditor();
 
   let buf = '';
   for (;;) {
@@ -204,6 +311,10 @@ $('connect').addEventListener('click', async () => {
       const line = buf.slice(0, nl).trim();
       buf = buf.slice(nl + 1);
       if (!line) continue;
+      if (line[0] === '{') {
+        try { onJson(JSON.parse(line)); } catch (e) { log(line); }
+        continue;
+      }
       const m = RE.exec(line);
       if (m) {
         paint(m);
