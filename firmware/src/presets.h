@@ -46,4 +46,11 @@ int  preset_page_find_latest(const uint8_t *page, uint32_t page_len,
 /* Byte offset of the next writable slot, or -1 when the page is full. */
 int  preset_page_next_offset(const uint8_t *page, uint32_t page_len);
 
+/* ---- Zephyr-only half, implemented in presets_flash.c ----
+ * Excluded from the host tests: everything above this line is pure. */
+bool preset_store_is_safe(void);   /* is the page ours to write? */
+bool preset_store_load(preset_bank_t *out);
+bool preset_store_save(const preset_bank_t *bank);
+void preset_store_dump(void);      /* Task 7.0, read only */
+
 #endif /* SP1_PRESETS_H */

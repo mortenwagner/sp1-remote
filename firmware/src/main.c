@@ -16,11 +16,13 @@
  */
 
 #include <zephyr/kernel.h>
+#include <string.h>
 #include "board_io.h"
 #include "midi_tx.h"
 #include "controls.h"
 #include "profile.h"
 #include "buttons.h"
+#include "presets.h"
 
 #define SP1_DIAG 1
 
@@ -44,6 +46,8 @@ static fader_state_t   g_fader[PROFILE_NUM_FADERS];
 static btn_state_t     g_btn[PROFILE_NUM_BUTTONS];
 static button_engine_t g_eng;
 static int             g_last_raw;      /* for the diagnostic line only */
+static uint32_t        g_save_blink_until;
+static bool            g_save_ok;
 
 /* Read the track ladder, handle the recovery combo, and debounce.
  *
@@ -60,6 +64,88 @@ static int             g_last_raw;      /* for the diagnostic line only */
  * ADC errors are tolerated briefly, then reported as "nothing pressed":
  * holding the last value forever would turn a transient failure into a
  * phantom press, which for a toggle means freeze flipping on its own. */
+/* Snapshot what the puck last SENT, which is all it knows: MIDI here is
+ * one-way, so anything changed from Push 3 or the synth's own menu is not
+ * captured. Accepted in the design. Freeze is excluded by the profile's
+ * capture list, since a scene should not re-trigger a live gesture.
+ *
+ * Every write is bounds-checked individually, not just the outer loop: a
+ * generic profile may map one CC to two faders, and then a single capture
+ * entry produces two messages. */
+static int snapshot_surface(const profile_t *prof, cc_msg_t *out, int out_max)
+{
+	int n = 0;
+
+	for (int c = 0; c < prof->preset_capture_len; c++) {
+		uint8_t cc = prof->preset_capture[c];
+
+		for (int f = 0; f < PROFILE_NUM_FADERS && n < out_max; f++) {
+			if (prof->fader[f].cc == cc && g_fader[f].have_sent) {
+				out[n].channel = prof->fader[f].channel;
+				out[n].cc      = cc;
+				out[n].value   = g_fader[f].last_sent;
+				n++;
+			}
+		}
+		for (int b = 0; b < PROFILE_NUM_BUTTONS && n < out_max; b++) {
+			const button_cfg_t *cfg = &prof->button[b];
+
+			if (cfg->mode == BTN_MODE_CYCLE && cfg->cc == cc) {
+				out[n].channel = cfg->channel;
+				out[n].cc      = cc;
+				out[n].value   =
+					cfg->steps[button_engine_step_index(&g_eng, b)];
+				n++;
+			}
+		}
+		if (n >= out_max) {
+			break;
+		}
+	}
+	return n;
+}
+
+/* preset_store_save takes BOTH slots, and the engine holds them separately,
+ * so the bank has to be assembled. Saving one slot alone would blank the
+ * other. */
+static bool persist_all_slots(void)
+{
+	preset_bank_t bank;
+
+	memset(&bank, 0, sizeof(bank));
+	for (int sl = 0; sl < BUTTON_MAX_PRESET_SLOTS; sl++) {
+		const preset_slot_t *ps = button_engine_get_preset(&g_eng, sl);
+
+		if (ps != NULL) {
+			bank.slot[sl] = *ps;
+		}
+	}
+	return preset_store_save(&bank);
+}
+
+/* A recall moves the synth out from under the faders and the cycle button.
+ * Without this the next ADC pass sees a fader where it was, decides that
+ * differs, and instantly undoes the scene; and shimmer's LED would lie. */
+static void resync_after_recall(const profile_t *prof,
+				const cc_msg_t *msgs, int n)
+{
+	for (int m = 0; m < n; m++) {
+		for (int f = 0; f < PROFILE_NUM_FADERS; f++) {
+			if (prof->fader[f].cc == msgs[m].cc &&
+			    prof->fader[f].channel == msgs[m].channel) {
+				fader_arm_pickup(&g_fader[f], msgs[m].value);
+			}
+		}
+		for (int b = 0; b < PROFILE_NUM_BUTTONS; b++) {
+			if (prof->button[b].mode == BTN_MODE_CYCLE &&
+			    prof->button[b].cc == msgs[m].cc &&
+			    prof->button[b].channel == msgs[m].channel) {
+				button_engine_sync_cycle(&g_eng, b, msgs[m].value);
+			}
+		}
+	}
+}
+
 static int debounced_track_button(void)
 {
 	static int     committed = -1, candidate = -1, count;
@@ -117,6 +203,20 @@ int main(void)
 	midi_tx_init();
 	button_engine_init(&g_eng, prof);
 
+	/* Load stored scenes. Silent: loading must not transmit, the puck
+	 * says nothing until a control is touched. */
+	{
+		preset_bank_t bank;
+
+		if (preset_store_load(&bank)) {
+			for (int sl = 0; sl < BUTTON_MAX_PRESET_SLOTS; sl++) {
+				button_engine_set_preset(&g_eng, sl,
+							 bank.slot[sl].msg,
+							 bank.slot[sl].len);
+			}
+		}
+	}
+
 	uint32_t held_ms = 0;
 
 	for (;;) {
@@ -164,6 +264,18 @@ int main(void)
 
 			/* Track row: freeze latched, shimmer off or not, and whether
 			 * each preset slot holds a scene. */
+			/* A save confirms itself: three fast blinks across the
+			 * track row when it worked, a single long one when the
+			 * write failed. A silent failure here would be invisible
+			 * until the scene did not come back. */
+			if (now_ms < g_save_blink_until) {
+				bool on = g_save_ok ? (((now_ms / 100) & 1) != 0)
+						    : true;
+
+				for (int b = 0; b < PROFILE_NUM_BUTTONS; b++) {
+					board_io_track_led_set(b, on);
+				}
+			} else {
 			board_io_track_led_set(0, button_engine_is_latched(&g_eng, 0));
 			board_io_track_led_set(1, button_engine_step_index(&g_eng, 1) != 0);
 			for (int b = 2; b < PROFILE_NUM_BUTTONS; b++) {
@@ -172,6 +284,7 @@ int main(void)
 								 prof->button[b].preset_slot);
 
 				board_io_track_led_set(b, ps != NULL && ps->len > 0);
+			}
 			}
 		}
 
@@ -215,6 +328,17 @@ int main(void)
 			uint32_t now = (uint32_t)k_uptime_get();
 			cc_msg_t msgs[PROFILE_MAX_CAPTURE];
 
+			/* PLAY dumps the storage page (Task 7.0). Read only, and
+			 * on a button rather than at boot: a CDC console discards
+			 * anything printed before the host opens the port. */
+			static bool play_was_down;
+			bool play_down = (pressed == 4);
+
+			if (play_down && !play_was_down) {
+				preset_store_dump();
+			}
+			play_was_down = play_down;
+
 			for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
 				uint8_t ev = btn_update(&g_btn[i], pressed == i, now);
 
@@ -226,11 +350,21 @@ int main(void)
 							   (int)ARRAY_SIZE(msgs));
 
 				if (n == BUTTON_ACTION_SAVE_PRESET) {
-					/* TODO(Phase 7): snapshot and persist. */
+					cc_msg_t snap[PROFILE_MAX_CAPTURE];
+					int slot = button_engine_pending_save_slot(&g_eng);
+					int sn = snapshot_surface(prof, snap,
+								  (int)ARRAY_SIZE(snap));
+
+					button_engine_set_preset(&g_eng, slot, snap, sn);
+					g_save_ok = persist_all_slots();
+					g_save_blink_until = now + 900u;
 					continue;
 				}
 				for (int k = 0; k < n; k++) {
 					midi_tx_send(msgs[k]);
+				}
+				if (n > 0) {
+					resync_after_recall(prof, msgs, n);
 				}
 			}
 		}
