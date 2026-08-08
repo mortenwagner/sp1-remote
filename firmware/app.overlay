@@ -1,0 +1,35 @@
+/*
+ * ADC channels for the four faders and the battery divider. Channels 0 and
+ * 1 (the button ladders) come from the board file; these five extend the
+ * same list, and firmware/src/board_io.c consumes ALL SEVEN BY INDEX via
+ * DT_PATH(zephyr_user). Reordering this list silently reassigns faders.
+ *
+ * Vendored from sp1-tape-looper firmware/app.overlay (MIT). The gain,
+ * reference and acquisition time must stay identical to the board file's
+ * channels 0-1: the button decode thresholds in board_io.c are calibrated
+ * raw values under exactly this configuration.
+ *
+ * Note the SP-1 has no MIDI UART. The TRS jack's MIDI line is bit-banged on
+ * P0.23 (see firmware/src/midi_trs.c), so nothing here describes it.
+ */
+
+&adc {
+	channel@2 { reg = <2>; zephyr,gain = "ADC_GAIN_1_6"; zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
+		zephyr,input-positive = <NRF_SAADC_AIN3>; zephyr,resolution = <12>; };   /* Fader 1 P0.05 */
+	channel@3 { reg = <3>; zephyr,gain = "ADC_GAIN_1_6"; zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
+		zephyr,input-positive = <NRF_SAADC_AIN6>; zephyr,resolution = <12>; };   /* Fader 2 P0.30 */
+	channel@4 { reg = <4>; zephyr,gain = "ADC_GAIN_1_6"; zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
+		zephyr,input-positive = <NRF_SAADC_AIN2>; zephyr,resolution = <12>; };   /* Fader 3 P0.04 */
+	channel@5 { reg = <5>; zephyr,gain = "ADC_GAIN_1_6"; zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
+		zephyr,input-positive = <NRF_SAADC_AIN7>; zephyr,resolution = <12>; };   /* Fader 4 P0.31 */
+	channel@6 { reg = <6>; zephyr,gain = "ADC_GAIN_1_6"; zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
+		zephyr,input-positive = <NRF_SAADC_AIN4>; zephyr,resolution = <12>; };   /* Battery level P0.28 (divider, per SP-1-dev wiki) */
+};
+&zephyr_user {
+	io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>, <&adc 4>, <&adc 5>, <&adc 6>;
+};

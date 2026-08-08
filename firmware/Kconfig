@@ -1,0 +1,11 @@
+# SP-1 Remote application Kconfig.
+#
+# Pulls in the common USB sample options (CONFIG_SAMPLE_USBD_VID / PID /
+# PRODUCT / MANUFACTURER / MAX_POWER) consumed by the sample_usbd_init.c
+# device_next bring-up helper that CMakeLists.txt includes, then the standard
+# Zephyr tree. Without this source line those symbols are undefined and the
+# build aborts on Kconfig warnings.
+
+source "samples/subsys/usb/common/Kconfig.sample_usbd"
+
+source "Kconfig.zephyr"

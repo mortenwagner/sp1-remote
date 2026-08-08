@@ -64,8 +64,7 @@
 		 * bootloader arms (a "BIG FIVE" requirement). */
 		watchdog0 = &wdt0;
 	};
-
-
+};
 
 &adc {
 	status = "okay";
