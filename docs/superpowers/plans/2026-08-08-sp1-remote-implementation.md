@@ -8,7 +8,9 @@
 
 **Tech Stack:** Zephyr RTOS v4.3.1, Zephyr SDK 0.17.4, CMake/Ninja/west, C11, host tests in plain C11 with clang, flashing via the local `solderless.engineering` mirror over WebSerial in Chrome.
 
-**Adversarial review:** this plan was red-teamed by Codex (gpt-5.6-sol, xhigh) against the tiliqua and SP-1 sources on 2026-08-08. It confirmed the three source claims below and returned twelve findings, of which two were device-recovery hazards, four were outright bugs, and one was an uncovered spec requirement. All are folded in; the ones that changed behaviour are called out at the point of change with a "REVIEW" note so the reasoning is not lost.
+**Adversarial review, twice.** This plan was red-teamed against the tiliqua and SP-1 sources on 2026-08-08, first by Codex (gpt-5.6-sol, xhigh) and then independently by Fable 5 reviewing the post-Codex version. Codex confirmed the three source claims below and returned twelve findings: two device-recovery hazards, four outright bugs, one uncovered spec requirement. Fable then verified every transplant citation against the looper source (all correct after the Codex round) and found five more, including one that Codex had left half-fixed and that mattered most of all: the documented Track 1 + Track 4 recovery combo falls inside this firmware's track-4 ADC band, so without an explicit pre-decode check it reads as a preset-save and destroys a stored scene instead of entering DFU. See Task 5.2 Step 1.
+
+All findings from both passes are folded in. Points where the reasoning would otherwise be lost are marked "REVIEW" at the site of the change.
 
 **Spec version this plan targets:** the 2026-08-08 design as revised the same day after the Codex 5.5 review and 5.6-sol verification (ClaudeLife commit `fd63e0d`). That revision reframed the firmware base, added a takeover policy, replaced per-fader rate limiting with a coalescing transmit queue, and pinned the freeze timing state machine. All four are implemented below.
 
@@ -98,6 +100,7 @@ sp1-remote/
       board_io.c / board_io.h     ADC ladders, button decode, LEDs, WDT, power
       midi_tx.c  / midi_tx.h      bit-banged TRS MIDI TX + the drain thread
       txqueue.c  / txqueue.h      PURE: the coalescing transmit queue
+      cc_msg.h                    PURE: the one shared message type
       profile.c  / profile.h      PURE: the config table + shipped default
       controls.c / controls.h     PURE: fader conditioning, pickup, button FSM
       buttons.c  / buttons.h      PURE: the unified button behaviour model
@@ -113,9 +116,9 @@ sp1-remote/
     test_profile.c
 ```
 
-`controls.c`, `buttons.c`, `presets.c`, `profile.c` and `txqueue.c` must not include any Zephyr header. That is what makes the host tests possible, and it is the single most important structural rule in this plan.
+`controls.c`, `buttons.c`, `presets.c`, `profile.c`, `txqueue.c` and `cc_msg.h` must not include any Zephyr header. That is what makes the host tests possible, and it is the single most important structural rule in this plan.
 
-**Every pure-logic implementation and every test in this plan was compiled and run before the plan was committed**, with `clang -std=c11 -Wall -Wextra -Werror`: 45 tests across five suites, all passing, including regression tests for the bugs the adversarial review found and for the lost-release case the toggle design is built to survive. A failure when you run them means a transcription slip, not a design problem.
+**Every pure-logic implementation and every test in this plan was compiled and run before the plan was committed**, with `clang -std=c11 -Wall -Wextra -Werror`: 48 tests across five suites, all passing, including regression tests for every bug the two adversarial reviews found: the lost-release case the toggle design survives by construction, pickup landing exactly on its target, the duplicate-value suppression branch, and a preset recall re-syncing the cycle step. A failure when you run them means a transcription slip, not a design problem.
 
 ---
 
@@ -357,7 +360,7 @@ BUILD   := build
 
 SRC_smoke    :=
 SRC_controls := ../../firmware/src/controls.c
-SRC_txqueue  := ../../firmware/src/txqueue.c ../../firmware/src/profile.c
+SRC_txqueue  := ../../firmware/src/txqueue.c
 SRC_profile  := ../../firmware/src/profile.c
 SRC_buttons  := ../../firmware/src/buttons.c ../../firmware/src/controls.c \
                 ../../firmware/src/profile.c
@@ -686,20 +689,33 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(sp1-remote)
 
+# Pulls in sample_usbd_init_device()/usbd_enable(), which the CDC console
+# needs because CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT=n means nothing
+# brings USB up on its own. The looper does exactly this at its
+# CMakeLists.txt:4. Omit it and the diagnostic console never enumerates.
+include(${ZEPHYR_BASE}/samples/subsys/usb/common/common.cmake)
+
 target_sources(app PRIVATE
   src/main.c
   src/board_io.c
+  src/txqueue.c
   src/controls.c
   src/buttons.c
   src/profile.c
-  src/txqueue.c
   src/presets.c
   src/presets_flash.c
   src/midi_tx.c
 )
 ```
 
-Create empty stubs for the files later phases fill in, each just its header include, so the build stays green from here.
+Later phases fill in most of these. To keep this task's firmware build green without breaking the "Expected: FAIL, X.h not found" checks that later tasks rely on, create **`.c` stubs only, with no headers**:
+
+```c
+/* Placeholder: filled in by Task N.N. */
+typedef int sp1_placeholder_t;
+```
+
+A stub header would make every later host-test failure check wrong; a missing `.c` would break this build. This is the combination that satisfies both.
 
 - [ ] **Step 5: Write `firmware/src/board_io.h`**
 
@@ -1066,7 +1082,29 @@ The spec is specific about this: one queue, latest value per CC wins, never a bl
   - `uint8_t txq_count(const txqueue_t *q);`
   - and in `midi_tx.h`: `void midi_tx_send(cc_msg_t m);`, the only function the rest of the firmware calls to transmit.
 
-Note the dependency direction: `txqueue.h` includes `profile.h` for `cc_msg_t`, which is why `cc_msg_t` is declared in `profile.h` (Task 4.2) rather than in `buttons.h`.
+**Build ordering matters here.** `cc_msg_t` lives in its own tiny header, `firmware/src/cc_msg.h`, created as Step 0 of this task. It is deliberately NOT in `profile.h`: the queue is built in Phase 3 and the profile table in Phase 4, so putting the shared type in the later file would make this task unbuildable. Everything downstream picks it up transitively.
+
+- [ ] **Step 0: Write `firmware/src/cc_msg.h`**
+
+```c
+/* PURE. One MIDI control-change message.
+ *
+ * Its own header, and not part of profile.h, purely for build ordering:
+ * the transmit queue (Phase 3) needs this type but must not depend on the
+ * profile table (Phase 4). Everything downstream gets it transitively. */
+#ifndef SP1_CC_MSG_H
+#define SP1_CC_MSG_H
+
+#include <stdint.h>
+
+typedef struct {
+    uint8_t channel;
+    uint8_t cc;
+    uint8_t value;
+} cc_msg_t;
+
+#endif /* SP1_CC_MSG_H */
+```
 
 - [ ] **Step 1: Write the failing test, `tests/host/test_txqueue.c`**
 
@@ -1207,10 +1245,8 @@ Expected: FAIL, `txqueue.h` not found.
 
 #include <stdbool.h>
 #include <stdint.h>
-#include "profile.h"
+#include "cc_msg.h"
 
-/* Sized well above the surface: 4 faders + 4 buttons + a 5-message preset
- * burst cannot exceed this even if every one is pending at once. */
 #define TXQ_MAX 16
 
 typedef struct {
@@ -1220,9 +1256,6 @@ typedef struct {
 } txqueue_t;
 
 void    txq_init(txqueue_t *q);
-
-/* Returns false only when the queue is full AND the message is new. A
- * message that coalesces into a pending entry always succeeds. */
 bool    txq_push(txqueue_t *q, cc_msg_t m);
 bool    txq_pop(txqueue_t *q, cc_msg_t *out);
 uint8_t txq_count(const txqueue_t *q);
@@ -1350,7 +1383,7 @@ Initialise all three primitives in `midi_tx_init` and start the thread there. Ad
 
 - [ ] **Step 7: Verify on hardware that nothing regressed**
 
-Change the Task 3.1 smoke test to call `midi_tx_send((cc_msg_t){0, 102, v})` instead of `midi_tx_cc` directly. Expected: identical behaviour on the monitor and on the synth. Then sweep the ramp faster than the wire (send every 1 ms) and confirm the monitor shows a smooth ramp of roughly one message per millisecond rather than a growing backlog, and that the values arriving are the latest ones rather than a lagging replay.
+Change the Task 3.1 smoke test to call `midi_tx_send((cc_msg_t){0, 102, v})` instead of `midi_tx_cc` directly. Expected: identical behaviour on the monitor and on the synth. Then push values in faster than the queue drains (call `midi_tx_send` every 1 ms) and confirm two things: the monitor shows roughly **200 messages per second, not 1000**, because the drain thread paces to the synth's 5 ms ISR, and the values arriving **step in jumps of about 6 rather than replaying every intermediate value**. That jumpiness IS the coalescing working. What you must not see is a backlog that keeps arriving after you stop feeding it.
 
 - [ ] **Step 8: Commit**
 
@@ -1440,15 +1473,20 @@ static void test_jitter_inside_deadband_is_ignored(void)
     CHECK(!fader_update(&st, 996,  &v));
 }
 
+/* A 7-bit step spans about 29 raw counts and CC 34 covers raw 976 to 1005,
+ * so a move of 20 counts inside that window clears the 8-count deadband and
+ * still lands on the same CC. That is the only way to reach the duplicate
+ * suppression branch: a smaller move is rejected by the deadband first and
+ * never gets there. */
 static void test_same_cc_value_is_not_resent(void)
 {
     fader_state_t st = {0};
     uint8_t v = 0;
-    CHECK(!fader_update(&st, 976, &v));
-    CHECK(fader_update(&st, 1000, &v));
+    CHECK(!fader_update(&st, 970, &v));     /* seed */
+    CHECK(fader_update(&st, 980, &v));      /* emits CC 34 */
     CHECK_EQ(v, 34);
-    /* 1005 is still inside CC 34's bucket (976 to 1005). */
-    CHECK(!fader_update(&st, 1005, &v));
+    CHECK_EQ(fader_raw_to_cc(1000), 34);    /* same bucket... */
+    CHECK(!fader_update(&st, 1000, &v));    /* ...so nothing is resent */
 }
 
 /* --- soft pickup after a preset recall --- */
@@ -1495,6 +1533,29 @@ static void test_pickup_from_above_also_catches(void)
     CHECK(!fader_update(&st, 2000, &v));         /* cc ~69, still above 40 */
     CHECK(fader_update(&st, 900, &v));           /* cc ~31, crossed below */
     CHECK(!fader_pickup_armed(&st));
+}
+
+/* Stopping exactly ON the recalled value is "caught" too. Arming adopts the
+ * target as last_sent, so without resolving pickup before the duplicate
+ * check this fader would stay armed forever, blinking its LED while already
+ * in agreement with the synth. */
+static void test_pickup_landing_exactly_on_target_disarms(void)
+{
+    fader_state_t st = {0};
+    uint8_t v = 0;
+    CHECK(!fader_update(&st, 300, &v));
+    CHECK(fader_update(&st, 400, &v));
+
+    uint8_t target = fader_raw_to_cc(2000);
+    fader_arm_pickup(&st, target);
+    CHECK(fader_pickup_armed(&st));
+
+    /* Land precisely on it: nothing to send, but pickup must let go. */
+    CHECK(!fader_update(&st, 2000, &v));
+    CHECK(!fader_pickup_armed(&st));
+
+    /* And the fader is live again immediately afterwards. */
+    CHECK(fader_update(&st, 2400, &v));
 }
 
 static void test_arming_pickup_adopts_the_recalled_value(void)
@@ -1568,6 +1629,7 @@ int main(void)
     RUN(test_pickup_suppresses_until_the_fader_crosses);
     RUN(test_pickup_not_armed_when_already_at_the_target);
     RUN(test_pickup_from_above_also_catches);
+    RUN(test_pickup_landing_exactly_on_target_disarms);
     RUN(test_arming_pickup_adopts_the_recalled_value);
     RUN(test_press_then_short_release_is_a_tap);
     RUN(test_hold_fires_once_and_release_is_not_a_tap);
@@ -1677,16 +1739,21 @@ bool fader_update(fader_state_t *st, int raw, uint8_t *out_value)
     st->last_raw = raw;
 
     uint8_t v = fader_raw_to_cc(raw);
-    if (st->have_sent && v == st->last_sent) {
-        return false;
-    }
 
+    /* Pickup is resolved BEFORE the duplicate-value check. Arming sets
+     * last_sent to the recalled target, so a fader that lands exactly ON
+     * the target would otherwise be rejected as a duplicate and stay armed
+     * forever, blinking its LED while it is in fact already in agreement. */
     if (st->pickup_armed) {
         int side = (v > st->pickup_target) - (v < st->pickup_target);
         if (side != 0 && side == st->pickup_side) {
-            return false;
+            return false;           /* still on the far side: suppressed */
         }
-        st->pickup_armed = false;
+        st->pickup_armed = false;   /* crossed or landed on it: caught */
+    }
+
+    if (st->have_sent && v == st->last_sent) {
+        return false;
     }
 
     st->last_sent = v;
@@ -1880,26 +1947,19 @@ Expected: FAIL, `profile.h` not found.
  * and nothing else. A browser-based editor over WebSerial that rewrites
  * this table at runtime is parked for v1.1.
  *
- * REVIEW: BTN_MODE_LIST and the per-button list[] exist because the frozen
- * spec requires "per-button CC list + channel" in the config table. Without
- * them the engine could emit lists but the table could not describe one, so
- * the generic-controller requirement was only half met. */
+ * BTN_MODE_LIST and the per-button list[] exist because the frozen spec
+ * requires "per-button CC list + channel" in the config table. */
 #ifndef SP1_PROFILE_H
 #define SP1_PROFILE_H
 
 #include <stdint.h>
+#include "cc_msg.h"
 
 #define PROFILE_NUM_FADERS   4
 #define PROFILE_NUM_BUTTONS  4
 #define PROFILE_MAX_STEPS    4
 #define PROFILE_MAX_CAPTURE  5
 #define PROFILE_MAX_BTN_LIST 5
-
-typedef struct {
-    uint8_t channel;
-    uint8_t cc;
-    uint8_t value;
-} cc_msg_t;
 
 typedef enum {
     BTN_MODE_TOGGLE  = 0,
@@ -2090,6 +2150,7 @@ git commit -m "feat: four faders drive their profile CCs through the queue"
   - `int  button_engine_pending_save_slot(const button_engine_t *e);`
   - `void button_engine_set_preset(button_engine_t *e, int slot, const cc_msg_t *msgs, int len);`
   - `const preset_slot_t *button_engine_get_preset(const button_engine_t *e, int slot);`
+  - `void button_engine_sync_cycle(button_engine_t *e, int idx, uint8_t value);`
   - `uint8_t button_engine_step_index(const button_engine_t *e, int idx);`
   - `bool button_engine_is_latched(const button_engine_t *e, int idx);`
 
@@ -2193,6 +2254,36 @@ static void test_cycle_starts_on_the_synths_default_step(void)
     CHECK_EQ(button_engine_step_index(&eng, 1), 2);
 }
 
+/* A recall replays CC 105, which moves shimmer on the synth. If the puck
+ * does not re-sync, its LED lies and the next press jumps from a stale
+ * position, and a later snapshot captures the stale step. */
+static void test_recall_resyncs_the_cycle_step(void)
+{
+    setup();
+    CHECK_EQ(button_engine_step_index(&eng, 1), 2);      /* Full at boot */
+
+    button_engine_sync_cycle(&eng, 1, 112);              /* recall sent Off */
+    CHECK_EQ(button_engine_step_index(&eng, 1), 0);
+
+    /* Nearest-match, not exact-match: a value between buckets still lands
+     * on the step the synth will have chosen. */
+    button_engine_sync_cycle(&eng, 1, 50);               /* nearest 48 = Full */
+    CHECK_EQ(button_engine_step_index(&eng, 1), 2);
+
+    /* And the next press steps on from there, not from the stale index. */
+    int n = button_engine_event(&eng, 1, BTN_EV_PRESS, out, OUT_MAX);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(out[0].value, 16);                          /* Full -> Boost */
+}
+
+static void test_sync_cycle_ignores_non_cycle_buttons(void)
+{
+    setup();
+    button_engine_sync_cycle(&eng, 0, 99);   /* freeze is a toggle */
+    button_engine_sync_cycle(&eng, 9, 99);   /* out of range */
+    CHECK(!button_engine_is_latched(&eng, 0));
+}
+
 /* --- presets: the only mode that waits for a release --- */
 
 static void test_preset_tap_replays_the_stored_list(void)
@@ -2259,6 +2350,8 @@ int main(void)
     RUN(test_shimmer_steps_and_wraps);
     RUN(test_shimmer_release_sends_nothing);
     RUN(test_cycle_starts_on_the_synths_default_step);
+    RUN(test_recall_resyncs_the_cycle_step);
+    RUN(test_sync_cycle_ignores_non_cycle_buttons);
     RUN(test_preset_tap_replays_the_stored_list);
     RUN(test_preset_press_alone_does_not_replay);
     RUN(test_empty_preset_sends_nothing);
@@ -2330,6 +2423,12 @@ int  button_engine_pending_save_slot(const button_engine_t *e);
 void button_engine_set_preset(button_engine_t *e, int slot,
                               const cc_msg_t *msgs, int len);
 const preset_slot_t *button_engine_get_preset(const button_engine_t *e, int slot);
+
+/* Re-sync a cycle button after a preset recall replayed its CC: pick the
+ * step whose value is nearest what was just sent. Without this the puck's
+ * step index, its LED, and the next press all disagree with the synth, and
+ * the next snapshot captures the stale step. */
+void button_engine_sync_cycle(button_engine_t *e, int idx, uint8_t value);
 
 /* For the LED layer. */
 uint8_t button_engine_step_index(const button_engine_t *e, int idx);
@@ -2493,6 +2592,31 @@ const preset_slot_t *button_engine_get_preset(const button_engine_t *e, int slot
     return &e->preset[slot];
 }
 
+void button_engine_sync_cycle(button_engine_t *e, int idx, uint8_t value)
+{
+    if (idx < 0 || idx >= PROFILE_NUM_BUTTONS) {
+        return;
+    }
+    const button_cfg_t *cfg = &e->prof->button[idx];
+    if (cfg->mode != BTN_MODE_CYCLE || cfg->n_steps == 0) {
+        return;
+    }
+
+    uint8_t best = 0;
+    int best_d = 256;
+    for (uint8_t i = 0; i < cfg->n_steps; i++) {
+        int d = (int)cfg->steps[i] - (int)value;
+        if (d < 0) {
+            d = -d;
+        }
+        if (d < best_d) {
+            best_d = d;
+            best   = i;
+        }
+    }
+    e->step_idx[idx] = best;
+}
+
 uint8_t button_engine_step_index(const button_engine_t *e, int idx)
 {
     return (idx >= 0 && idx < PROFILE_NUM_BUTTONS) ? e->step_idx[idx] : 0u;
@@ -2515,7 +2639,7 @@ Expected: PASS for all five suites.
 
 ```bash
 git add firmware/src/buttons.c firmware/src/buttons.h tests/host
-git commit -m "feat: unified button model, freeze latch/pedal, cycle and preset"
+git commit -m "feat: unified button model, freeze toggle, cycle and preset"
 ```
 
 ---
@@ -2525,7 +2649,65 @@ git commit -m "feat: unified button model, freeze latch/pedal, cycle and preset"
 **Files:**
 - Modify: `firmware/src/main.c`
 
-- [ ] **Step 1: Add sticky debounce for the shared ladder**
+- [ ] **Step 1: Check the recovery combo BEFORE decoding any button**
+
+This is the single most dangerous omission an executor could make, so it comes first. The looper detects Track 1 + Track 4 as its own raw ADC band, 1280 to 1390, and checks it *before* `decode_tracks`, with the comment "so the combo isn't mistaken for a Track-4 press" (`main.c:6964-6981`).
+
+That band sits inside this firmware's track-4 range (950 to 1500, Task 2.1 Step 6). Track 4 is preset B. So **without this check, holding the documented recovery combo for two seconds fires `BTN_EV_HOLD` on preset B: it writes flash, destroys the stored scene, and never enters DFU.** The one gesture that is supposed to rescue a wedged puck instead becomes a destructive write on scarce hardware.
+
+```c
+/* FAILSAFE, transplanted from sp1-tape-looper main.c:6964-6981 (MIT).
+ * Track 1 + Track 4 together read as a distinct ADC band (~1325, between
+ * track 4 at ~1220 and play at ~1823). Held 1.2 s it resets into the
+ * bootloader. Checked BEFORE decode: the band lies inside track 4's range,
+ * so decoding first would turn the recovery gesture into a preset save.
+ * Time-based rather than a per-iteration counter so a slow control pass
+ * cannot skew the threshold. */
+#define COMBO14_LO      1280
+#define COMBO14_HI      1390
+#define COMBO14_HOLD_MS 1200
+
+static int debounced_track_button(void)
+{
+    static int committed = -1, candidate = -1, count;
+    static int64_t combo14_t = -1;
+    static int err_run;
+
+    int raw = board_io_read_track_ladder();
+    if (raw < 0) {
+        /* Holding the committed value forever on ADC failure is how a
+         * pressed button becomes a phantom press that toggles freeze on
+         * its own. Tolerate a few bad reads, then report nothing pressed. */
+        if (++err_run < 10) {
+            return committed;
+        }
+        committed = -1;
+        combo14_t = -1;
+        return committed;
+    }
+    err_run = 0;
+
+    if (raw >= COMBO14_LO && raw <= COMBO14_HI) {
+        if (combo14_t < 0) {
+            combo14_t = k_uptime_get();
+        } else if (k_uptime_get() - combo14_t >= COMBO14_HOLD_MS) {
+            board_io_enter_dfu();          /* does not return */
+        }
+        committed = -1;                    /* never a button while in-band */
+        candidate = -1;
+        count     = 0;
+        return committed;
+    }
+    combo14_t = -1;
+    ...
+}
+```
+
+Expose `board_io_enter_dfu()` from `board_io.c` (transplanted from `main.c:5744-5753`) and add it to `board_io.h`. Add to Task 2.1's interface list.
+
+Note this makes the combo unavailable as a normal chord, which is fine: the surface has no chords (see Step 3).
+
+- [ ] **Step 2: Add sticky debounce for the shared ladder**
 
 The track buttons sit on one noisy resistor ladder, so a single raw read at a band boundary can name the wrong button. The looper commits a new value only after three consecutive agreeing reads (`main.c:7513-7519`). Do the same:
 
@@ -2535,19 +2717,7 @@ The track buttons sit on one noisy resistor ladder, so a single raw read at a ba
 static int debounced_track_button(void)
 {
     static int committed = -1, candidate = -1, count;
-    static int err_run;
-    int raw = board_io_read_track_ladder();
-    if (raw < 0) {
-        /* REVIEW: holding the committed value forever on ADC failure is how
-         * a pressed button becomes a stuck pedal. Tolerate a few bad reads,
-         * then report "nothing pressed" and let the release happen. */
-        if (++err_run < 10) {
-            return committed;
-        }
-        committed = -1;
-        return committed;
-    }
-    err_run = 0;
+    /* (the combo and ADC-error handling from Step 1 sit here) */
     int b = board_io_decode_track_button(raw);
     if (b == committed) {
         count = 0;
@@ -2560,7 +2730,7 @@ static int debounced_track_button(void)
 }
 ```
 
-- [ ] **Step 2: Feed the engine from the control loop**
+- [ ] **Step 3: Feed the engine from the control loop**
 
 Add `#include "buttons.h"` to `main.c`, declare the engine next to `g_fader`, and initialise it before the loop:
 
@@ -2603,20 +2773,21 @@ Queuing the whole burst at once is deliberate: the drain thread paces it on the 
 
 Only one ladder button can be read at a time by construction, so simultaneous presses are not supported. That matches the spec's surface, which has no chords.
 
-- [ ] **Step 3: Build, flash, and test at the rack**
+- [ ] **Step 4: Build, flash, and test at the rack**
 
 Expected, in this order:
 1. Press track 1: freeze engages. Press again: it releases. It should feel immediate, because it acts on the press.
 2. Hold track 1 down for several seconds and let go: **nothing happens on release**, freeze simply stays on. That is correct now, and it is the property that makes a lost release harmless.
 3. Press track 2 four times: shimmer steps through its four states and returns to the start.
 4. Press track 3 or 4 briefly: nothing yet (no preset stored).
-5. Hammer it: fast repeated presses, two buttons at once, presses during a fader sweep. Confirm the freeze LED and the audible state never disagree. A toggle that misses a press shows up here as an inverted state, and the fix is one more press, but you want to know how often it happens.
+5. **Verify the recovery combo actually recovers.** Hold Track 1 + Track 4 together for about 1.5 s with the app running. Expected: all four track LEDs light and the puck resets into the bootloader. Then confirm preset B was NOT overwritten. If instead the preset-save blink fires, Step 1 is missing or the band is wrong on this unit, and you have just lost your recovery path.
+6. Hammer it: fast repeated presses, two buttons at once, presses during a fader sweep. Confirm the freeze LED and the audible state never disagree. A toggle that misses a press shows up here as an inverted state, and the fix is one more press, but you want to know how often it happens.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add firmware/src/main.c
-git commit -m "feat: track buttons drive freeze and shimmer on the synth"
+git commit -m "feat: track buttons drive freeze and shimmer, recovery combo wired"
 ```
 
 ---
@@ -2630,6 +2801,8 @@ git commit -m "feat: track buttons drive freeze and shimmer on the synth"
 - Modify: `firmware/src/board_io.c` (only if Task 2.3 found brightness unavailable)
 
 An honest framing, per the revised spec: these LEDs show the **puck's own state**, which equals the synth's state only while the takeover policy holds. MIDI here is one-way and there is no readback, so nothing on this panel can prove the other end is listening.
+
+The bounded consequence, worth knowing before it confuses you at the rack: if the puck reboots while the synth is frozen, the puck comes up believing freeze is off and stays silent, so unfreezing takes two presses with a wrong LED in between. If the synth is power-cycled instead, the mirror case applies, and shimmer needs at most four presses to re-agree. No design without readback can do better than this, and every case self-corrects within one full cycle of the control.
 
 - [ ] **Step 1: Mirror fader values on the centre row**
 
@@ -2668,7 +2841,7 @@ Blink one LED briefly on each transmission. Call it what it is in the code comme
 
 - [ ] **Step 5: Verify on hardware**
 
-Expected: moving a fader visibly changes its LED; freeze shows as a lit track LED and clears when released; shimmer brightness or state steps with each tap; a fader in pickup blinks until it catches. Nothing flickers when the puck is left alone: a flickering idle LED means the fader deadband is letting jitter through and Task 2.2's measurement needs revisiting.
+Expected: moving a fader visibly changes its LED; freeze shows as a lit track LED and clears on the **second press** (releasing the button does nothing, which is the point of the toggle); shimmer brightness or state steps with each tap; a fader in pickup blinks until it catches. Nothing flickers when the puck is left alone: a flickering idle LED means the fader deadband is letting jitter through and Task 2.2's measurement needs revisiting.
 
 - [ ] **Step 6: Commit**
 
@@ -2691,7 +2864,9 @@ REVIEW raised this as a device-recovery hazard, and it is the right call. Both r
 
 - [ ] **Step 1: Dump the page, read only**
 
-Behind `SP1_DIAG`, print the full 4 KB at `0xFF000` as hex over the console, once at boot. Read only: no erase, no write.
+Behind `SP1_DIAG`, print the full 4 KB at `0xFF000` as hex over the console. Read only: no erase, no write.
+
+**Do not print it at boot.** A CDC-ACM console throws away everything written before the host opens the port, so a one-shot boot dump is usually invisible, and this dump gates a STOP rule. Trigger it on a button press instead (any track button will do, the profile is not wired up yet at this point in the plan), or gate it on DTR being asserted.
 
 ```c
         const struct flash_area *fa;
@@ -3103,6 +3278,14 @@ bool preset_store_save(const preset_bank_t *bank)
         if (off >= 0) {
             uint8_t rec[PRESET_REC_SIZE];
             preset_record_encode(bank, rec);
+            /* On nRF52840 a flash word write stalls the CPU for ~41 us and
+             * a page erase for ~85 ms. A MIDI bit is 32 us, so a write
+             * landing mid-byte can corrupt that byte's framing on the wire
+             * (the receiver resyncs at the next status byte) and will
+             * visibly stutter the LED soft-PWM. Saving is a deliberate 2 s
+             * gesture and rarely overlaps a sweep, so this is a nuisance
+             * rather than a fault, but if it shows up, let the transmit
+             * queue drain before writing. */
             ok = (flash_area_write(fa, (off_t)off, rec, sizeof(rec)) == 0);
         }
     }
@@ -3181,8 +3364,8 @@ Then confirm on the LEDs: blink that button's track LED three times fast. A fail
 This is the takeover policy, and it is the one place the puck knowingly desyncs its own faders from what it just sent. After queueing a preset's messages, arm pickup on every fader whose CC was in that burst:
 
 ```c
-static void arm_pickup_for_recall(const profile_t *prof,
-                                  const cc_msg_t *msgs, int n)
+static void resync_after_recall(const profile_t *prof,
+                                const cc_msg_t *msgs, int n)
 {
     for (int m = 0; m < n; m++) {
         for (int f = 0; f < PROFILE_NUM_FADERS; f++) {
@@ -3191,11 +3374,22 @@ static void arm_pickup_for_recall(const profile_t *prof,
                 fader_arm_pickup(&g_fader[f], msgs[m].value);
             }
         }
+        /* Cycle buttons need it too. A recall replays CC 105, which moves
+         * shimmer on the synth; without this the puck's step index, its
+         * LED, and the next press all disagree with what it just sent, and
+         * the next snapshot captures the stale step. */
+        for (int b = 0; b < PROFILE_NUM_BUTTONS; b++) {
+            if (prof->button[b].mode == BTN_MODE_CYCLE &&
+                prof->button[b].cc == msgs[m].cc &&
+                prof->button[b].channel == msgs[m].channel) {
+                button_engine_sync_cycle(&eng, b, msgs[m].value);
+            }
+        }
     }
 }
 ```
 
-Call it immediately after the loop that queues the messages, in the same branch. Without this, the first ADC pass after a recall sees the fader sitting where it was, decides that differs from the recalled value, and instantly undoes the whole scene.
+Call it immediately after the loop that queues the messages, in the same branch. Without the fader half, the first ADC pass after a recall sees the fader sitting where it was, decides that differs from the recalled value, and instantly undoes the whole scene. Without the cycle half, shimmer's LED lies and the next press jumps.
 
 - [ ] **Step 5: Build, flash and test the full gesture**
 
@@ -3229,7 +3423,7 @@ The spec's stop rule: if after one real session the puck does not beat Push 3 fo
 
 - [ ] **Step 1: Play one real rack session**
 
-String synth, puck on the desk, Push 3 pushed out of reach (the takeover policy says the puck owns these four CCs during a performance, so do not ride them from both). Ride cutoff, reverb wet, delay time and delay feedback from the faders. Use freeze as a pedal at least twice. Step shimmer at least once. Store and recall both presets.
+String synth, puck on the desk, Push 3 pushed out of reach (the takeover policy says the puck owns these four CCs during a performance, so do not ride them from both). Ride cutoff, reverb wet, delay time and delay feedback from the faders. Toggle freeze on and off at least twice. Step shimmer at least once. Store and recall both presets.
 
 - [ ] **Step 2: Write down what actually happened**
 
@@ -3296,5 +3490,6 @@ git push origin main --tags
 - **The TRS MIDI TX is not proven in writing, and the sync jack is undocumented.** Mitigated by Phase 0 preceding the bench, by Task 1.2 measuring source resistance and drive current before anything is connected to the Tiliqua, and by Task 1.3's decision tree.
 - **The pucks are unreleased prototypes.** Mitigated by developing on one, by the recovery drill in Task 1.1, and by the BIG FIVE constraints being restated at the top of `main.c`.
 - **Touch-fader jitter becoming CC zipper.** Mitigated by sizing the deadband from measured jitter in Task 2.2, by the coalescing queue, and by the synth's own CC smoothing. The idle-flicker check in Task 6.1 is the canary.
+- **The recovery combo colliding with a real button.** Track 1 + Track 4 sits inside track 4's ADC band, so decode order is load-bearing: get it wrong and the rescue gesture becomes a flash write. Mitigated by the pre-decode band check in Task 5.2 Step 1 and by the explicit rack test that the combo reaches DFU without touching preset B. This was found only on the second review pass, after the first had already "fixed" the missing hatch.
 - **~~A missed button release leaving freeze stuck on.~~ Designed out.** This was the single most session-ruining failure in the surface, and the toggle decision removes the mechanism rather than mitigating it: release is inert, so there is nothing for a lost release to strand. What remains is a much milder failure, a missed *press* leaving the puck's idea of freeze inverted from the synth's, which costs one extra press and re-syncs by itself. The bounded ADC-error run in `debounced_track_button` still matters, because a phantom press would toggle freeze spuriously.
 - **A recall being undone by the first fader nudge.** Mitigated by soft pickup (Task 7.2 Step 4) and made visible by the blinking LED (Task 6.1 Step 2).
