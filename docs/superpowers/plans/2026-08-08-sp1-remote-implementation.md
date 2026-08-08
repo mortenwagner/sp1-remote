@@ -61,6 +61,7 @@ Fallback if the transplant stalls at board bring-up: a direct looper fork with t
 - **Flash image format:** raw `.bin`, written to `0x20000`, maximum size `0xDF000` (`solderless/utility/js/protocol.js:8-13`). The flasher never touches `0xFF000` and above, so the 4 KB storage partition survives a reflash. Preset data must live there and nowhere else.
 - **Only one 4 KB page of storage exists** (`0xFF000` to `0x100000`). Zephyr NVS needs two sectors, so it is not usable. Presets use an append-log inside the single page (Phase 7).
 - **Do not erase that page until its ownership is proved.** REVIEW: both reference board files *label* `0xFF000` as `storage`, but a label is not evidence that the TE bootloader does not keep settings or recovery metadata there. Erasing it on a hunch is a plausible soft-brick. Task 7.0 dumps and inspects the page before anything writes to it, and the append-log is designed so that the erase only happens after 102 saves, by which point the page is demonstrably ours.
+- **Two transmit sinks, one queue.** Every message goes to the TRS jack (the delivery path, and the only one popgoblin can hear) and to USB MIDI (a development instrument, and later a way to drive a Mac). ADDED 2026-08-08, overriding the spec's "no USB MIDI" non-goal, because it decouples all firmware behaviour work from the single undocumented part of this hardware. Note what it does NOT do: `popgoblin/top.py:249-253` instantiates only the TRS serial receiver, with no USB MIDI host, so USB cannot drive the string synth. Only `polysyn` has a USB MIDI host.
 - **No changes to the synth.** Not gateware, not firmware. The popgoblin CC map is the entire contract.
 - **Fader full-scale raw code is 3700** on the 12-bit SAADC as configured (gain 1/6, 0.6 V internal reference, 20 us acquisition). Source: `main.c:7487`. Confirm on this unit in Task 2.2 and size the deadband from measured jitter, per the spec's revised risk note.
 - **Transmit path:** send-on-change with a per-fader deadband, and **every** message goes through ONE coalescing transmit queue where the latest value for a given (channel, CC) wins. No per-fader millisecond rate limit: four faders naively limited to one message per 10 ms each would occupy about 38 percent of the 31250 baud wire, and coalescing keeps worst-case latency flat when all four move together. The control loop must never block on transmission.
@@ -98,7 +99,9 @@ sp1-remote/
     src/
       main.c                      init + the control loop, nothing else
       board_io.c / board_io.h     ADC ladders, button decode, LEDs, WDT, power
-      midi_tx.c  / midi_tx.h      bit-banged TRS MIDI TX + the drain thread
+      midi_tx.c  / midi_tx.h      the drain thread + fan-out to both sinks
+      midi_trs.c / midi_trs.h     bit-banged TRS MIDI TX (the delivery path)
+      midi_usb.c / midi_usb.h     USB MIDI 2 sink (development + Mac use)
       txqueue.c  / txqueue.h      PURE: the coalescing transmit queue
       cc_msg.h                    PURE: the one shared message type
       profile.c  / profile.h      PURE: the config table + shipped default
@@ -705,6 +708,8 @@ target_sources(app PRIVATE
   src/presets.c
   src/presets_flash.c
   src/midi_tx.c
+  src/midi_trs.c
+  src/midi_usb.c
 )
 ```
 
@@ -959,40 +964,43 @@ The end-to-end proof, plus the queue that keeps the wire honest.
 
 ### Task 3.1: Bit-banged TRS MIDI transmitter
 
+**Naming, because there are two sinks by the end of this phase:** `midi_trs_*` is the bit-banged TRS jack (this task), `midi_usb_*` is USB MIDI (Task 3.3), and `midi_tx_*` is the layer above both: the coalescing queue and the drain thread that fans out to them (Task 3.2). Callers outside this phase only ever use `midi_tx_send`.
+
 **Files:**
-- Create: `firmware/src/midi_tx.h`
-- Create: `firmware/src/midi_tx.c`
+- Create: `firmware/src/midi_trs.h`
+- Create: `firmware/src/midi_trs.c`
 - Modify: `firmware/src/main.c`
 
 **Interfaces:**
 - Produces:
-  - `void midi_tx_init(void);`
-  - `void midi_tx_byte(uint8_t b);`
-  - `void midi_tx_cc(uint8_t channel, uint8_t cc, uint8_t value);` (channel is the wire value, 0 to 15)
+  - `void midi_trs_init(void);`
+  - `void midi_trs_send_byte(uint8_t b);`
+  - `void midi_trs_send_cc(uint8_t channel, uint8_t cc, uint8_t value);` (channel is the wire value, 0 to 15)
 
-- [ ] **Step 1: Write `firmware/src/midi_tx.h`**
+- [ ] **Step 1: Write `firmware/src/midi_trs.h`**
 
 ```c
-/* TRS MIDI transmit on the SP-1 sync jack.
+/* TRS MIDI transmit on the SP-1 sync jack. One of two sinks; the queue in
+ * midi_tx.c fans out to this and to USB MIDI.
  *
  * The sync jack's ring is driven by P0.23 (BC807 base) through a PNP that
  * INVERTS the line, so the waveform is bit-banged rather than handed to a
  * UART peripheral. A hardware timer clocks one bit per ISR with interrupts
  * left on. Transplanted from sp1-tape-looper firmware/src/main.c:4398-4530
  * (MIT). */
-#ifndef SP1_MIDI_TX_H
-#define SP1_MIDI_TX_H
+#ifndef SP1_MIDI_TRS_H
+#define SP1_MIDI_TRS_H
 
 #include <stdint.h>
 
-void midi_tx_init(void);
-void midi_tx_byte(uint8_t b);
-void midi_tx_cc(uint8_t channel, uint8_t cc, uint8_t value);
+void midi_trs_init(void);
+void midi_trs_send_byte(uint8_t b);
+void midi_trs_send_cc(uint8_t channel, uint8_t cc, uint8_t value);
 
-#endif /* SP1_MIDI_TX_H */
+#endif /* SP1_MIDI_TRS_H */
 ```
 
-- [ ] **Step 2: Write `firmware/src/midi_tx.c`**
+- [ ] **Step 2: Write `firmware/src/midi_trs.c`**
 
 Transplant `midi_pins_init`, `midi_line`, `midi_timer_isr`, `midi_timer_init` and `midi_send` from `main.c:4419-4530` unchanged, keeping the constants:
 
@@ -1009,34 +1017,29 @@ Set `MIDI_INVERT` to whatever Task 1.3 recorded as working. Drop the Pocket-Oper
 Then add the only new code in this file:
 
 ```c
-void midi_tx_cc(uint8_t channel, uint8_t cc, uint8_t value)
+void midi_trs_send_cc(uint8_t channel, uint8_t cc, uint8_t value)
 {
-    midi_tx_byte((uint8_t)(0xB0u | (channel & 0x0Fu)));
-    midi_tx_byte(cc & 0x7Fu);
-    midi_tx_byte(value & 0x7Fu);
+    midi_trs_send_byte((uint8_t)(0xB0u | (channel & 0x0Fu)));
+    midi_trs_send_byte(cc & 0x7Fu);
+    midi_trs_send_byte(value & 0x7Fu);
 }
 ```
 
-`midi_tx_init` is not free either: REVIEW flagged that the plan called it without defining it. It must call the transplanted `midi_pins_init()` and `midi_timer_init()`, initialise the `midi_tx_done` semaphore, and (from Task 3.2) start the drain thread:
+`midi_trs_init` is not free either: REVIEW flagged that the plan called it without defining it. It must bring up the pins and the timer. The queue and its drain thread are initialised separately, in `midi_tx_init` (Task 3.2):
 
 ```c
-void midi_tx_init(void)
+void midi_trs_init(void)
 {
     midi_pins_init();     /* transplanted, main.c:4443-4460 */
     midi_timer_init();    /* transplanted, main.c:4515-4527 */
-    txq_init(&tx_q);
-    k_mutex_init(&tx_lock);
-    k_sem_init(&tx_wake, 0, 1);
-    k_thread_create(&tx_tcb, tx_stack, MIDI_TX_STACK, midi_tx_thread,
-                    NULL, NULL, NULL, MIDI_TX_PRIO, 0, K_NO_WAIT);
 }
 ```
 
-`midi_tx_byte` is the transplanted `midi_send`, renamed. Note in a comment that each byte occupies 320 us on the wire (10 bits at 32 us), so a three-byte CC is just under 1 ms. That number is the basis of the queue sizing in Task 3.2.
+`midi_trs_send_byte` is the transplanted `midi_send`, renamed. Note in a comment that each byte occupies 320 us on the wire (10 bits at 32 us), so a three-byte CC is just under 1 ms. That number is the basis of the queue sizing in Task 3.2.
 
 - [ ] **Step 3: Add a MIDI smoke test to `main.c`**
 
-Behind `SP1_DIAG`, send `midi_tx_cc(0, 102, v)` once every 100 ms with `v` ramping 0 to 127 and back, so cutoff sweeps continuously without touching anything.
+Behind `SP1_DIAG`, send `midi_trs_send_cc(0, 102, v)` once every 100 ms with `v` ramping 0 to 127 and back, so cutoff sweeps continuously without touching anything.
 
 - [ ] **Step 4: Build and flash**
 
@@ -1057,7 +1060,7 @@ SP-1 into the Tiliqua MIDI-in with popgoblin running. Expected: the cutoff optio
 Append the result to `docs/hardware-notes.md`, including the final `MIDI_INVERT` value.
 
 ```bash
-git add firmware/src/midi_tx.c firmware/src/midi_tx.h firmware/src/main.c docs/hardware-notes.md
+git add firmware/src/midi_trs.c firmware/src/midi_trs.h firmware/src/main.c docs/hardware-notes.md
 git commit -m "feat: bit-banged TRS MIDI TX, cutoff sweep confirmed on the synth"
 ```
 
@@ -1367,7 +1370,7 @@ static void midi_tx_thread(void *a, void *b, void *c)
             continue;
         }
 
-        midi_tx_cc(m.channel, m.cc, m.value);
+        midi_trs_send_cc(m.channel, m.cc, m.value);
         /* Pace to the RECEIVER, not to the wire. popgoblin's MIDI FIFO is
          * 8 entries (top.py:150) and its firmware pops exactly one per
          * 5 ms timer ISR (main.rs:28,100), so anything faster than 200
@@ -1379,11 +1382,25 @@ static void midi_tx_thread(void *a, void *b, void *c)
 }
 ```
 
-Initialise all three primitives in `midi_tx_init` and start the thread there. Add `void midi_tx_send(cc_msg_t m);` to `midi_tx.h`, and include `txqueue.h` from it.
+`midi_tx_init` owns the queue, the mutex, the semaphore and the thread, and calls `midi_trs_init()` (and later `midi_usb_init()`) itself, so `main.c` only ever calls `midi_tx_init()`:
+
+```c
+void midi_tx_init(void)
+{
+    midi_trs_init();
+    txq_init(&tx_q);
+    k_mutex_init(&tx_lock);
+    k_sem_init(&tx_wake, 0, 1);
+    k_thread_create(&tx_tcb, tx_stack, MIDI_TX_STACK, midi_tx_thread,
+                    NULL, NULL, NULL, MIDI_TX_PRIO, 0, K_NO_WAIT);
+}
+```
+
+Create `firmware/src/midi_tx.h` with `midi_tx_init`, `midi_tx_send`, and an include of `txqueue.h`.
 
 - [ ] **Step 7: Verify on hardware that nothing regressed**
 
-Change the Task 3.1 smoke test to call `midi_tx_send((cc_msg_t){0, 102, v})` instead of `midi_tx_cc` directly. Expected: identical behaviour on the monitor and on the synth. Then push values in faster than the queue drains (call `midi_tx_send` every 1 ms) and confirm two things: the monitor shows roughly **200 messages per second, not 1000**, because the drain thread paces to the synth's 5 ms ISR, and the values arriving **step in jumps of about 6 rather than replaying every intermediate value**. That jumpiness IS the coalescing working. What you must not see is a backlog that keeps arriving after you stop feeding it.
+Change the Task 3.1 smoke test to call `midi_tx_send((cc_msg_t){0, 102, v})` instead of `midi_trs_send_cc` directly. Expected: identical behaviour on the monitor and on the synth. Then push values in faster than the queue drains (call `midi_tx_send` every 1 ms) and confirm two things: the monitor shows roughly **200 messages per second, not 1000**, because the drain thread paces to the synth's 5 ms ISR, and the values arriving **step in jumps of about 6 rather than replaying every intermediate value**. That jumpiness IS the coalescing working. What you must not see is a backlog that keeps arriving after you stop feeding it.
 
 - [ ] **Step 8: Commit**
 
@@ -1392,6 +1409,102 @@ git add firmware/src/txqueue.c firmware/src/txqueue.h firmware/src/midi_tx.c \
         firmware/src/midi_tx.h tests/host
 git commit -m "feat: coalescing transmit queue with a drain thread"
 ```
+
+---
+
+### Task 3.3: USB MIDI as a second sink
+
+Everything from here on can then be developed and watched at the desk with one USB-C cable, instead of needing the hand-built adapter or the rack. That matters because the TRS jack is the one part of this hardware with no published documentation, and without this task every behaviour bug in Phases 4 to 7 is entangled with it.
+
+**Files:**
+- Create: `firmware/src/midi_usb.h`
+- Create: `firmware/src/midi_usb.c`
+- Modify: `firmware/src/midi_tx.c` (fan out to both sinks)
+- Modify: `firmware/prj.conf`, `firmware/CMakeLists.txt`
+
+**Interfaces:**
+- Produces:
+  - `void midi_usb_init(void);`
+  - `void midi_usb_send_cc(uint8_t channel, uint8_t cc, uint8_t value);`
+  - `bool midi_usb_ready(void);`
+
+- [ ] **Step 1: Enable the class**
+
+```conf
+# USB MIDI 2 alongside the CDC console: a composite device. sp1-midi ships
+# exactly this pair and the looper independently proves composite works on
+# this hardware (it runs UAC2 + CDC).
+CONFIG_USBD_MIDI2_CLASS=y
+CONFIG_MIDI2_UMP_STREAM_RESPONDER=y
+```
+
+- [ ] **Step 2: Write `firmware/src/midi_usb.c`**
+
+Lift the send path from `refs/sp1-midi/app/MidiController.cpp:12-18`, which is C++ but trivially transliterated. The whole thing is:
+
+```c
+#include <zephyr/usb/class/usbd_midi2.h>
+#include <zephyr/audio/midi.h>
+#include "midi_usb.h"
+
+#define UMP_GROUP 0
+
+static const struct device *midi_dev;
+static atomic_t usb_ready;
+
+void midi_usb_send_cc(uint8_t channel, uint8_t cc, uint8_t value)
+{
+    /* Silently drop when no host is listening. A puck on battery at the
+     * rack is the normal case, not an error. */
+    if (!atomic_get(&usb_ready) || midi_dev == NULL) {
+        return;
+    }
+    const struct midi_ump ump = UMP_MIDI1_CHANNEL_VOICE(
+        UMP_GROUP, UMP_MIDI_CONTROL_CHANGE, channel & 0x0Fu,
+        cc & 0x7Fu, value & 0x7Fu);
+    usbd_midi_send(midi_dev, ump);
+}
+```
+
+`midi_usb_init` fetches the device and registers the ready callback that sets `usb_ready`. Follow `sp1-midi/app/main.cpp` for the registration order relative to `usbd_enable()`, since the CDC console shares the same USB context.
+
+- [ ] **Step 3: Fan out in the drain thread**
+
+One queue, two sinks. In `midi_tx_thread`, replace the single send with:
+
+```c
+        midi_trs_send_cc(m.channel, m.cc, m.value);
+        midi_usb_send_cc(m.channel, m.cc, m.value);
+        k_msleep(MIDI_TX_SPACING_MS);
+```
+
+Keep the 5 ms pacing even though USB does not need it. It exists for popgoblin's FIFO, and one pace for both sinks means what you watch on the Mac is exactly what the synth receives, which is the entire point of using USB as the development view.
+
+- [ ] **Step 4: Verify both sinks at once**
+
+Connect USB-C to the Mac AND the TRS adapter to a MIDI interface. Run the Task 3.1 ramp.
+
+Expected: the same CC 102 ramp arrives on both, at the same rate, with the same values. The SP-1 should appear by name in the Mac's MIDI device list.
+
+- [ ] **Step 5: The test that justifies caution — does USB traffic corrupt the TRS bits?**
+
+This is the one real risk in adding USB, and it needs an explicit check. The TRS transmitter is bit-banged: a hardware timer drives one bit per ISR at 32 us spacing, with interrupts left on (`main.c:4425-4435`). USB adds a SOF interrupt every 1 ms plus transfer interrupts, any of which can delay a bit edge. Enough delay corrupts the byte's framing.
+
+With USB connected and enumerated, and ideally with the host also polling, run the ramp for several minutes into the MIDI monitor and watch for framing errors, dropped bytes or wrong values on the **TRS** side.
+
+Evidence it should be fine: the looper ran isochronous USB audio (UAC2, far heavier than MIDI) alongside this same timer bit-bang, and its changelog treats the MIDI clock as usable. But that is inference, and a corrupted byte here is exactly the sort of thing that gets blamed on the cable at the rack three weeks later. Measure it.
+
+If it does corrupt: the fallback is to suppress USB sends while a TRS byte is in flight, or to accept USB as a bench-only mode compiled out of the release build. Record which, and why, in `docs/hardware-notes.md`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add firmware/src/midi_usb.c firmware/src/midi_usb.h firmware/src/midi_tx.c \
+        firmware/prj.conf firmware/CMakeLists.txt docs/hardware-notes.md
+git commit -m "feat: USB MIDI as a second sink, so behaviour is testable at the desk"
+```
+
+**Contingency:** if Task 1.3 failed or was inconclusive, pull this task ahead of 3.1. USB MIDI needs nothing from the sync jack, so the entire firmware can be built and validated while the TRS electrical question stays open.
 
 ---
 
@@ -2110,7 +2223,9 @@ int main(void)
 
 `midi_tx_send` pushes and returns, so a fader sweep never blocks this loop and never delays the watchdog. All four faders are read every pass: the looper round-robins them only because its ADC reads compete with an eMMC streamer, which this firmware does not have. If the console shows the loop overrunning, fall back to round-robin.
 
-- [ ] **Step 2: Build, flash, and test at the bench with the MIDI monitor**
+- [ ] **Step 2: Build, flash, and test at the desk over USB**
+
+From here on the fastest loop is USB-C to the Mac with a MIDI monitor open, no adapter and no rack. Validate on TRS at the end of the phase, not for every edit.
 
 Expected, in order:
 1. Power on and touch nothing: **no MIDI at all**. This is the silent-boot rule and it is easy to get wrong.
@@ -3480,6 +3595,7 @@ git push origin main --tags
 ## Parked for later (not in this plan)
 
 - **v1.1 WebSerial profile editor.** A browser page that rewrites the profile table over the CDC console: any CC, any channel, per control. Proven feasible on this hardware by the solderless flasher and by feldd's browser remapping. This is what makes the firmware genuinely generic rather than PopGoblin-shaped.
+  **Blocked on storage, not on the UI.** `profile_popgoblin_default` is `const`, compiled into the app image at `0x20000`, which the flasher overwrites on every firmware update. A runtime-editable profile has to live in the storage page at `0xFF000`, and that is the only 4 KB page there is, already holding the preset append-log. The sizes fit comfortably (the profile is roughly 140 bytes, preset records are 40), so they can share the page, but it needs a combined layout and it depends on **Task 7.0 proving the page is ours at all**. If Task 7.0 finds the bootloader owns it, presets and the editor have to be rethought together. Settle that before starting the browser page, or you will build the fun part and discover the boring blocker halfway in.
 - **MIDI clock output.** The transplanted TX already carries the code path; it needs a tempo source. Only worth it if the synth-side delay clock-sync work lands.
 - **Momentary freeze (press-and-lift) as a per-button option.** Traded away for v1 in favour of a plain toggle, because it made the release load-bearing. If the first session shows you reaching for sub-second stabs, it comes back as a third button mode rather than as the default, so the robust behaviour stays the one you get by accident.
 - **Function button as a shift layer** for a second CC bank, which would give palette cycling (CC 43) a home. YAGNI until v1 has been performed with.
@@ -3489,6 +3605,7 @@ git push origin main --tags
 
 - **The TRS MIDI TX is not proven in writing, and the sync jack is undocumented.** Mitigated by Phase 0 preceding the bench, by Task 1.2 measuring source resistance and drive current before anything is connected to the Tiliqua, and by Task 1.3's decision tree.
 - **The pucks are unreleased prototypes.** Mitigated by developing on one, by the recovery drill in Task 1.1, and by the BIG FIVE constraints being restated at the top of `main.c`.
+- **USB interrupt activity jittering the bit-banged TRS bit edges.** A 32 us bit driven from a timer ISR does not have much margin, and USB adds an interrupt every millisecond. Mitigated by the explicit soak test in Task 3.3 Step 5, and by the looper having run much heavier isochronous USB audio against the same transmitter. If it bites, USB becomes a bench-only build.
 - **Touch-fader jitter becoming CC zipper.** Mitigated by sizing the deadband from measured jitter in Task 2.2, by the coalescing queue, and by the synth's own CC smoothing. The idle-flicker check in Task 6.1 is the canary.
 - **The recovery combo colliding with a real button.** Track 1 + Track 4 sits inside track 4's ADC band, so decode order is load-bearing: get it wrong and the rescue gesture becomes a flash write. Mitigated by the pre-decode band check in Task 5.2 Step 1 and by the explicit rack test that the combo reaches DFU without touching preset B. This was found only on the second review pass, after the first had already "fixed" the missing hatch.
 - **~~A missed button release leaving freeze stuck on.~~ Designed out.** This was the single most session-ruining failure in the surface, and the toggle decision removes the mechanism rather than mitigating it: release is inert, so there is nothing for a lost release to strand. What remains is a much milder failure, a missed *press* leaving the puck's idea of freeze inverted from the synth's, which costs one extra press and re-syncs by itself. The bounded ADC-error run in `debounced_track_button` still matters, because a phantom press would toggle freeze spuriously.

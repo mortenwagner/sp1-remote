@@ -23,7 +23,17 @@ those gestures, and it feels better than menu-diving.
 ## Non-goals (v1)
 
 - No audio playback from the puck (stems/beds parked — decided 2026-08-08).
-- No BLE, no USB MIDI, no multi-puck anything. One puck, one cable.
+- No BLE, no multi-puck anything. **USB MIDI ADDED 2026-08-08 (Morten),
+  overriding this non-goal:** the puck also enumerates as a USB MIDI device
+  so faders/buttons/presets can be developed and watched on the Mac with
+  one USB-C cable, instead of every behaviour test depending on the
+  hand-built TRS adapter or the rack. Nearly free, because the chosen base
+  (`sp1-midi`) already implements it. Note what it does NOT do: popgoblin
+  instantiates only the TRS serial receiver (`top.py:249-253`), with no USB
+  MIDI host, so USB cannot drive the string synth — TRS stays the delivery
+  path. Only `polysyn` has a USB MIDI host. One risk to measure: USB
+  interrupts jittering the bit-banged TRS bit edges (32 us/bit), tested
+  explicitly in plan Task 3.3 Step 5.
 - No MIDI clock output (the looper firmware already proves it; add later as
   v1.1 if the delay clock-sync firmware task lands on the synth side).
 - No changes to the string synth at all (gateware or firmware). The synth's
@@ -243,6 +253,18 @@ design record; the repo owns everything from here.
   `ShimmerLevel` iterates Boost, Full, Low, Off with `index = cc*4/128`,
   so the buckets are 0-31 Boost, 32-63 Full, 64-95 Low, 96-127 Off. The
   puck sends bucket centres and starts on Full, where the synth boots.
+- **Second review pass by Fable 5** on the post-Codex plan (raw notes at
+  `sp1-remote/docs/fable-review-2026-08-08.md`). It re-verified every
+  transplant citation and the shimmer/CC64 claims against source, and found
+  5 more issues. The important one: the Track1+Track4 DFU rescue combo
+  falls inside this firmware's track-4 ADC band, and track 4 is preset B.
+  The looper checks that combo BEFORE decoding buttons for exactly this
+  reason. Without the pre-decode check the documented recovery gesture
+  would have fired hold-to-save instead: a flash write destroying the
+  stored scene, and DFU never reached. Fixed, with a rack test.
+  Also: a preset recall never re-synced the shimmer step (LED lied, next
+  press jumped), the transmit queue depended on a type created a phase
+  later, and the repo's spec copy was stale. All fixed.
 - **Rate ceiling is the synth, not the wire:** popgoblin pops one MIDI FIFO
   entry per 5 ms ISR, so 200 msg/s is the real limit. The TX queue paces
   to that.
