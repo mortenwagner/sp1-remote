@@ -17,7 +17,7 @@ USB MIDI controller.
 | Phase | | |
 |---|---|---|
 | 0 | toolchain | done, proved by a byte-identical rebuild of the reference firmware |
-| 1 | recovery drill | **passed**; TRS proven later with a plain cable, no multimeter needed |
+| 1 | recovery drill | **passed**; TRS works with a plain cable, once ring and both tip pins are driven (2026-11-06) |
 | 2 | board bring-up | done and verified: LEDs, watchdog, power-off, charging, DFU escape hatch |
 | 3 | transmit path | done; USB MIDI verified live on the Mac |
 | 4 | faders | done and verified: all four drive CC 102/104/107/108 across 0-127 |
@@ -26,9 +26,11 @@ USB MIDI controller.
 | 7 | presets | done and verified: save, persist across a power cycle, recall |
 
 **The whole signal chain is now proven on hardware**, including TRS MIDI
-out, which needs only an ordinary 3.5 mm cable: data is on the tip (P0.20,
-Type A), so it reaches a Type A input like the Tiliqua's or a USB MIDI
-interface directly.
+out into opto-isolated Type A inputs (the Tiliqua, a Blokas Midihub) with
+an ordinary 3.5 mm TRS cable. That took three things, found on 2026-11-06:
+the ring's current source switched on (P0.23 low), and the tip sunk by
+both of its parallel pins (P0.20 and P0.17) in step. See
+`docs/hardware-notes.md`.
 
 - Plan: `docs/superpowers/plans/2026-08-08-sp1-remote-implementation.md`
 - Design: `docs/spec.md`

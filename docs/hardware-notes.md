@@ -213,7 +213,48 @@ It is also the first successful write to the relocated storage region at
 0xF7000, which validates moving off the bootloader settings page at
 0xFF000, where the safety gate had correctly refused.
 
+## TRS MIDI into opto inputs FIXED, 2026-11-06
+
+The 2026-08-08 result below was real but incomplete. Its receiver evidently
+read the tip as a logic level; a standard **opto-isolated** Type A input
+(the Blokas Midihub, the Tiliqua's H11L1 behind 220R) saw nothing at all.
+Morten noticed on 2026-11-05 that the Tiliqua didn't respond.
+
+Three findings, each tested on pop on 2026-11-06:
+
+| Firmware | Midihub (opto) | Tiliqua (H11L1) |
+|---|---|---|
+| tip only, P0.20 (the 8/8 build) | nothing, input light dark | nothing |
+| + ring current source (P0.23 low) | **664 msgs, all six CCs, ch 1, none malformed** | nothing |
+| + high drive on P0.20 | (not re-tested) | nothing |
+| + second tip pin P0.17, in step with P0.20 | (not re-tested) | **MIDI LED lights** |
+
+Control: a 5 V Pro-2 into the same Tiliqua input lights its LED, so the
+Tiliqua side was never at fault.
+
+- **The ring must source current.** A Type A opto's LED sits between the
+  sender's ring and tip. The ring's supply is the BC807 PNP, base on P0.23,
+  LOW = on. feldd drives it low once at init and leaves it
+  (`midi_out.c`, `midi_ring_gpios`); we had copied only feldd's tip pin.
+- **One tip pin cannot sink enough for an H11L1.** The board wires P0.20 and
+  P0.17 to the tip in parallel, presumably each through its own resistor
+  (sized for Pocket Operator sync). Both must sink together. feldd's
+  `app.overlay` anticipates exactly this and defers it; nobody had built it.
+- **The two pins must switch together**, or they fight through their
+  resistors. Each gets its own UARTE (UARTE1 on P0.20, UARTE0 on P0.17,
+  UARTE0 being the unused Bluetooth UART), set up at register level with
+  identical settings and started back to back with interrupts locked.
+  See `firmware/src/midi_trs.c`.
+- The ring source is switched off before SYSTEM_OFF, which would otherwise
+  latch it on through a cable left plugged in.
+
+Still unknown: the actual resistor values and how much margin the Tiliqua
+now has. The Midihub has not been re-tested with the two-pin build.
+
 ## TRS MIDI PROVEN, 2026-08-08
+
+*Superseded in part: see the 2026-11-06 section above. This capture
+worked, but opto-isolated inputs did not.*
 
 With the UARTE rewrite (data on the TIP, P0.20, Type A) and an **ordinary
 3.5 mm TRS cable** into a USB MIDI interface. Captured both paths at once

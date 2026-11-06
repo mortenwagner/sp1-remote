@@ -18,6 +18,7 @@
 #include <zephyr/kernel.h>
 #include <string.h>
 #include "board_io.h"
+#include "midi_trs.h"
 #include "midi_tx.h"
 #include "controls.h"
 #include "profile.h"
@@ -246,6 +247,7 @@ int main(void)
 			if (held_since == 0u) {
 				held_since = now_ms ? now_ms : 1u;
 			} else if ((uint32_t)(now_ms - held_since) >= POWER_HOLD_MS) {
+				midi_trs_release();          /* ring source off before SYSTEM_OFF latches it */
 				board_io_power_off();       /* does not return */
 			}
 		} else {
