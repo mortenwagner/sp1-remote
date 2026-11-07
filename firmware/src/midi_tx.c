@@ -65,11 +65,16 @@ static void midi_tx_thread(void *a, void *b, void *c)
 		}
 
 		n_drained++;
-		midi_trs_send_cc(m.channel, m.cc, m.value);
 		if (midi_usb_ready()) {
 			n_usb++;
 		}
-		midi_usb_send_cc(m.channel, m.cc, m.value);
+		if (m.cc == CC_MSG_PROGRAM) {
+			midi_trs_send_pc(m.channel, m.value);
+			midi_usb_send_pc(m.channel, m.value);
+		} else {
+			midi_trs_send_cc(m.channel, m.cc, m.value);
+			midi_usb_send_cc(m.channel, m.cc, m.value);
+		}
 		k_msleep(MIDI_TX_SPACING_MS);
 	}
 }

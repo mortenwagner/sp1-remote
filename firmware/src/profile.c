@@ -1,6 +1,6 @@
 #include "profile.h"
 
-const profile_t profile_popgoblin_default = {
+const profile_t profile_popgoblin_v2 = {
     .fader = {
         { .cc = 102, .channel = 0 },
         { .cc = 104, .channel = 0 },
@@ -29,4 +29,32 @@ const profile_t profile_popgoblin_default = {
     },
     .preset_capture     = { 102, 104, 107, 108, 105 },
     .preset_capture_len = 5,
+};
+
+/* The PopGoblin loop engine (tiliqua docs/superpowers/specs/
+ * 2026-11-06-popgoblin-loop-engine-design.md). Faders keep their CC
+ * numbers; the synth reinterprets 107 as grains and 108 as loop keep.
+ * PLAY (next chord) and the rocker (song) live in perform.c, outside this
+ * four-button table. */
+const profile_t profile_popgoblin_default = {
+    .fader = {
+        { .cc = 102, .channel = 0 },    /* tone  */
+        { .cc = 104, .channel = 0 },    /* wash  */
+        { .cc = 107, .channel = 0 },    /* grains */
+        { .cc = 108, .channel = 0 },    /* loop keep */
+    },
+    .button = {
+        {   /* freeze the loop */
+            .mode = BTN_MODE_TOGGLE, .channel = 0, .cc = 64,
+            .on_value = 127, .off_value = 0,
+        },
+        {   /* sub-drone on/off */
+            .mode = BTN_MODE_TOGGLE, .channel = 0, .cc = 86,
+            .on_value = 127, .off_value = 0,
+        },
+        { .mode = BTN_MODE_HOLD, .channel = 0, .cc = 87 },   /* stutter 1/8  */
+        { .mode = BTN_MODE_HOLD, .channel = 0, .cc = 88 },   /* stutter 1/16 */
+    },
+    .preset_capture     = { 102, 104, 107, 108 },
+    .preset_capture_len = 4,
 };

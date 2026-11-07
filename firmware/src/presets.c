@@ -144,7 +144,7 @@ static void put_button(uint8_t *d, const button_cfg_t *b)
 
 static bool get_button(const uint8_t *d, button_cfg_t *b)
 {
-    if (d[0] > (uint8_t)BTN_MODE_LIST) {
+    if (d[0] > (uint8_t)BTN_MODE_HOLD) {
         return false;
     }
     memset(b, 0, sizeof(*b));

@@ -16,4 +16,7 @@ void midi_trs_send_cc(uint8_t channel, uint8_t cc, uint8_t value);
 /* Switch the ring current source off; call right before power-off. */
 void midi_trs_release(void);
 
+/* Program Change, one 2-byte DMA. */
+void midi_trs_send_pc(uint8_t channel, uint8_t program);
+
 #endif /* SP1_MIDI_TRS_H */

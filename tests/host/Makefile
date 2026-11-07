@@ -11,8 +11,9 @@ SRC_txqueue  := $(SRC)/txqueue.c
 SRC_profile  := $(SRC)/profile.c
 SRC_buttons  := $(SRC)/buttons.c $(SRC)/controls.c $(SRC)/profile.c
 SRC_presets  := $(SRC)/presets.c $(SRC)/buttons.c $(SRC)/controls.c $(SRC)/profile.c
+SRC_perform  := $(SRC)/perform.c
 
-TESTS := smoke controls txqueue profile buttons presets
+TESTS := smoke controls txqueue profile buttons presets perform
 
 .PHONY: all test clean
 all: test

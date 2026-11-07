@@ -44,19 +44,31 @@ both of its parallel pins (P0.20 and P0.17) in step. See
 
 ## Default profile
 
+The PopGoblin loop engine (2026-11-06; the July chain-v2 table is kept in
+`profile.c` as `profile_popgoblin_v2`).
+
 | Control | MIDI | PopGoblin function |
 |---|---|---|
-| Fader 1 | CC 102 | filter cutoff |
-| Fader 2 | CC 104 | reverb wet |
-| Fader 3 | CC 107 | delay time |
-| Fader 4 | CC 108 | delay feedback |
-| Track button 1 | CC 64 | freeze, toggles on press |
-| Track button 2 | CC 105 | shimmer, steps off / low / full / boost |
-| Track button 3 | CC burst | preset A: press to recall, hold 2 s to save |
-| Track button 4 | CC burst | preset B: press to recall, hold 2 s to save |
+| Fader 1 | CC 102 | tone (filter cutoff) |
+| Fader 2 | CC 104 | wash (reverb) |
+| Fader 3 | CC 107 | grains |
+| Fader 4 | CC 108 | loop keep (how long the loop remembers) |
+| Track button 1 | CC 64 | freeze the loop, toggles on press |
+| Track button 2 | CC 86 | sub-drone on/off, toggles on press |
+| Track button 3 | CC 87 | stutter 1/8 while held (127 repeated every 100 ms, 0 on release) |
+| Track button 4 | CC 88 | stutter 1/16 while held |
+| PLAY | CC 85 = 127 | next chord (the Tiliqua lands it on the beat) |
+| Rocker | Program Change 0-7 | song -/+, with wrap |
+| Function + PLAY | none | dump the storage page on the console |
 
-To change the mapping, edit `firmware/src/profile.c`. Nothing else in the
-firmware hard-codes a CC number.
+The side LEDs show the song number in binary (bottom LED = 1), like
+Syrup's presets, and flash on a PLAY press. The track LEDs show freeze,
+sub, and the two stutters while held. A stored button profile from an
+older build (record version 1) is ignored, so the puck comes up with this
+table.
+
+To change the faders and track buttons, edit `firmware/src/profile.c`.
+PLAY, the rocker and the stutter CCs live in `firmware/src/perform.h`.
 
 ## Running the tests
 

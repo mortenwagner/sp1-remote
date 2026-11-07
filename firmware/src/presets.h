@@ -53,7 +53,9 @@ int  preset_page_next_offset(const uint8_t *page, uint32_t page_len);
 #define PROFILE_REC_SIZE  144
 #define PROFILE_MAGIC_0   0x53   /* 'S' */
 #define PROFILE_MAGIC_1   0x43   /* 'C' */
-#define PROFILE_REC_VER   1
+/* 2 since the loop-engine layout (2026-11-06): a v1 record holds the July
+ * chain-v2 buttons and is ignored, so the new shipped mapping applies. */
+#define PROFILE_REC_VER   2
 
 void profile_record_encode(const profile_t *prof, uint8_t rec[PROFILE_REC_SIZE]);
 bool profile_record_decode(const uint8_t rec[PROFILE_REC_SIZE], profile_t *out);

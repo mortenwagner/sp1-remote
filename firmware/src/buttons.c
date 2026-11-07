@@ -86,6 +86,11 @@ int button_engine_event(button_engine_t *e, int idx, uint8_t ev,
         }
         return 0;
 
+    case BTN_MODE_HOLD:
+        /* Sent by the performance layer (perform.c), which needs the
+         * live button state and the clock for its repeats. */
+        return 0;
+
     case BTN_MODE_PRESET:
         /* The one mode that MUST wait for the release, because a press
          * alone cannot yet be distinguished from the start of a

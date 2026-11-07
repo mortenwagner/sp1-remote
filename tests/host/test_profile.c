@@ -4,7 +4,7 @@
 
 static void test_default_profile_matches_the_spec(void)
 {
-    const profile_t *p = &profile_popgoblin_default;
+    const profile_t *p = &profile_popgoblin_v2;
 
     CHECK_EQ(p->fader[0].cc, 102);
     CHECK_EQ(p->fader[1].cc, 104);
@@ -33,7 +33,7 @@ static void test_default_profile_matches_the_spec(void)
  * would silently invert the control. */
 static void test_shimmer_steps_hit_the_right_enum_buckets(void)
 {
-    const button_cfg_t *b = &profile_popgoblin_default.button[1];
+    const button_cfg_t *b = &profile_popgoblin_v2.button[1];
     CHECK_EQ(b->n_steps, 4);
 
     const char *name[4] = { "off", "low", "full", "boost" };
@@ -51,7 +51,7 @@ static void test_shimmer_steps_hit_the_right_enum_buckets(void)
 
 static void test_preset_capture_list_uses_existing_ccs_only(void)
 {
-    const profile_t *p = &profile_popgoblin_default;
+    const profile_t *p = &profile_popgoblin_v2;
     CHECK_EQ(p->preset_capture_len, 5);
     for (int i = 0; i < p->preset_capture_len; i++) {
         uint8_t cc = p->preset_capture[i];
@@ -65,8 +65,27 @@ static void test_preset_capture_list_uses_existing_ccs_only(void)
     }
 }
 
+/* The shipped loop-engine mapping. */
+static void test_loop_profile_layout(void)
+{
+    const profile_t *p = &profile_popgoblin_default;
+    CHECK_EQ(p->fader[0].cc, 102);
+    CHECK_EQ(p->fader[1].cc, 104);
+    CHECK_EQ(p->fader[2].cc, 107);
+    CHECK_EQ(p->fader[3].cc, 108);
+    CHECK_EQ(p->button[0].mode, BTN_MODE_TOGGLE);
+    CHECK_EQ(p->button[0].cc, 64);
+    CHECK_EQ(p->button[1].mode, BTN_MODE_TOGGLE);
+    CHECK_EQ(p->button[1].cc, 86);
+    CHECK_EQ(p->button[2].mode, BTN_MODE_HOLD);
+    CHECK_EQ(p->button[2].cc, 87);
+    CHECK_EQ(p->button[3].mode, BTN_MODE_HOLD);
+    CHECK_EQ(p->button[3].cc, 88);
+}
+
 int main(void)
 {
+    RUN(test_loop_profile_layout);
     RUN(test_default_profile_matches_the_spec);
     RUN(test_shimmer_steps_hit_the_right_enum_buckets);
     RUN(test_preset_capture_list_uses_existing_ccs_only);

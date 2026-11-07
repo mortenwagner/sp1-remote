@@ -95,7 +95,7 @@ static void test_full_page_reports_no_room(void)
 static void test_profile_round_trip(void)
 {
     uint8_t rec[PROFILE_REC_SIZE];
-    profile_t in = profile_popgoblin_default, out = profile_popgoblin_default;
+    profile_t in = profile_popgoblin_v2, out = profile_popgoblin_v2;
 
     in.fader[0].cc = 20; in.fader[0].channel = 3;
     in.button[1].steps[0] = 7; in.button[1].init_step = 1;
@@ -114,7 +114,7 @@ static void test_profile_round_trip(void)
 static void test_profile_decode_keeps_the_builds_capture_list(void)
 {
     uint8_t rec[PROFILE_REC_SIZE];
-    profile_t in = profile_popgoblin_default, out = profile_popgoblin_default;
+    profile_t in = profile_popgoblin_v2, out = profile_popgoblin_v2;
 
     profile_record_encode(&in, rec);
     out.preset_capture_len = 5;
@@ -126,7 +126,7 @@ static void test_profile_decode_keeps_the_builds_capture_list(void)
 static void test_profile_corrupt_is_rejected(void)
 {
     uint8_t rec[PROFILE_REC_SIZE];
-    profile_t in = profile_popgoblin_default, out = profile_popgoblin_default;
+    profile_t in = profile_popgoblin_v2, out = profile_popgoblin_v2;
 
     profile_record_encode(&in, rec);
     rec[7] ^= 0xFF;
@@ -136,7 +136,7 @@ static void test_profile_corrupt_is_rejected(void)
 static void test_profile_bad_mode_is_rejected(void)
 {
     uint8_t rec[PROFILE_REC_SIZE];
-    profile_t in = profile_popgoblin_default, out = profile_popgoblin_default;
+    profile_t in = profile_popgoblin_v2, out = profile_popgoblin_v2;
 
     profile_record_encode(&in, rec);
     rec[12] = 99;                              /* button 0 mode out of range */
@@ -160,13 +160,13 @@ static void test_profile_page_latest_wins(void)
     static uint8_t pg[4096];
     memset(pg, 0xFF, sizeof(pg));
 
-    profile_t a = profile_popgoblin_default, b = profile_popgoblin_default;
+    profile_t a = profile_popgoblin_v2, b = profile_popgoblin_v2;
     a.fader[0].cc = 11;
     b.fader[0].cc = 22;
     profile_record_encode(&a, pg + 0);
     profile_record_encode(&b, pg + PROFILE_REC_SIZE);
 
-    profile_t out = profile_popgoblin_default;
+    profile_t out = profile_popgoblin_v2;
     CHECK_EQ(profile_page_find_latest(pg, sizeof(pg), &out), 1);
     CHECK_EQ(out.fader[0].cc, 22);
     CHECK_EQ(profile_page_next_offset(pg, sizeof(pg)), 2 * PROFILE_REC_SIZE);

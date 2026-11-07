@@ -180,6 +180,16 @@ void midi_trs_send_cc(uint8_t channel, uint8_t cc, uint8_t value)
 	trs_send(msg, 3u);
 }
 
+void midi_trs_send_pc(uint8_t channel, uint8_t program)
+{
+	const uint8_t msg[2] = {
+		(uint8_t)(0xC0u | (channel & 0x0Fu)),
+		(uint8_t)(program & 0x7Fu),
+	};
+
+	trs_send(msg, 2u);
+}
+
 void midi_trs_release(void)
 {
 	ring_source(false);

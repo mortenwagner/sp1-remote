@@ -158,6 +158,23 @@ int board_io_decode_track_button(int v)
 	return 4;                  /* play,    ~1823 */
 }
 
+int board_io_read_vol_ladder(void)
+{
+	return ladder_read(&adc_ladder[LAD_VOL]);
+}
+
+/* Bands from Syrup (looper main.c:5276-5283). Same ADC configuration as
+ * the track ladder. NOT yet re-measured on pop: check the `vol=` value in
+ * the diagnostic line if a rocker press does nothing. */
+int board_io_decode_vol(int v)
+{
+	if (v <  200) return -1;   /* none              */
+	if (v <  560) return 0;    /* rocker down, ~404 */
+	if (v <  950) return 1;    /* vol-down,    ~729 */
+	if (v < 1500) return 2;    /* rocker up,  ~1220 */
+	return 3;                  /* vol-up,     ~1820 */
+}
+
 /* ======================================================================
  *  LEDs: soft PWM (main.c:5121-5240)
  *

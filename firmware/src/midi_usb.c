@@ -54,6 +54,18 @@ void midi_usb_send_cc(uint8_t channel, uint8_t cc, uint8_t value)
 	usbd_midi_send(midi_dev, ump);
 }
 
+void midi_usb_send_pc(uint8_t channel, uint8_t program)
+{
+	if (!midi_usb_ready() || !device_is_ready(midi_dev)) {
+		return;
+	}
+	const struct midi_ump ump = UMP_MIDI1_CHANNEL_VOICE(
+		SP1_UMP_GROUP, UMP_MIDI_PROGRAM_CHANGE, channel & 0x0Fu,
+		program & 0x7Fu, 0);
+
+	usbd_midi_send(midi_dev, ump);
+}
+
 void midi_usb_init(void)
 {
 	if (!device_is_ready(midi_dev)) {

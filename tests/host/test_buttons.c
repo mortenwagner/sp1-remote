@@ -9,7 +9,7 @@ static cc_msg_t out[OUT_MAX];
 
 static void setup(void)
 {
-    button_engine_init(&eng, &profile_popgoblin_default);
+    button_engine_init(&eng, &profile_popgoblin_v2);
 }
 
 /* --- freeze: a plain toggle on the press --- */

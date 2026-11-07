@@ -24,6 +24,7 @@
 #include "profile.h"
 #include "buttons.h"
 #include "presets.h"
+#include "perform.h"
 #include "config_console.h"
 
 #define SP1_DIAG 1
@@ -45,6 +46,7 @@
 #define LADDER_ERR_LIMIT 10
 
 profile_t              g_profile;      /* the live, editable mapping */
+static perform_t       g_perf;         /* songs, chords, held stutters  */
 static fader_state_t   g_fader[PROFILE_NUM_FADERS];
 static btn_state_t     g_btn[PROFILE_NUM_BUTTONS];
 static button_engine_t g_eng;
@@ -198,6 +200,46 @@ static int debounced_track_button(void)
 	return committed;
 }
 
+/* The vol/rocker ladder, the same three-pass debounce as the track ladder
+ * (transplanted from Syrup). -1 none, 0 rocker down, 1 vol-down, 2 rocker
+ * up, 3 vol-up. */
+static int g_last_vol_raw;
+
+static int debounced_vol_button(void)
+{
+	static int committed = -1, candidate = -1, count;
+	static int err_run;
+
+	int raw = board_io_read_vol_ladder();
+
+	g_last_vol_raw = raw;
+
+	if (raw < 0) {
+		if (++err_run < LADDER_ERR_LIMIT) {
+			return committed;
+		}
+		committed = candidate = -1;
+		count = 0;
+		return committed;
+	}
+	err_run = 0;
+
+	int b = board_io_decode_vol(raw);
+
+	if (b == committed) {
+		count = 0;
+	} else if (b == candidate) {
+		if (++count >= 3) {
+			committed = b;
+			count = 0;
+		}
+	} else {
+		candidate = b;
+		count = 1;
+	}
+	return committed;
+}
+
 int main(void)
 {
 	/* The live profile is a RAM copy, so it can be edited over the console
@@ -213,6 +255,7 @@ int main(void)
 	midi_tx_init();
 	config_console_init();
 	button_engine_init(&g_eng, prof);
+	perform_init(&g_perf, prof->fader[0].channel);
 
 	/* Load stored scenes. Silent: loading must not transmit, the puck
 	 * says nothing until a control is touched. */
@@ -269,15 +312,23 @@ int main(void)
 			uint32_t now_ms = (uint32_t)k_uptime_get();
 			bool     blink  = ((now_ms / 200) & 1) != 0;
 
+			/* Side column: the song number in binary, bottom LED
+			 * = bit 0 (Syrup's preset code). A PLAY press flashes the
+			 * whole column. A fader in soft pickup still blinks its
+			 * LED, since it is not in control yet. */
+			uint8_t code = perform_side_code(&g_perf);
+			bool    flash = perform_flash(&g_perf, now_ms);
+
 			for (int i = 0; i < PROFILE_NUM_FADERS; i++) {
+				unsigned from_bottom = (unsigned)(PROFILE_NUM_FADERS - 1 - i);
 				uint8_t level;
 
 				if (fader_pickup_armed(&g_fader[i])) {
 					level = blink ? 255u : 0u;
-				} else if (!g_fader[i].have_sent) {
-					level = 0u;
+				} else if (flash) {
+					level = 255u;
 				} else {
-					level = (uint8_t)((g_fader[i].last_sent * 255) / 127);
+					level = ((code >> from_bottom) & 1u) ? 255u : 0u;
 				}
 				board_io_led_set(i, level);
 			}
@@ -296,14 +347,22 @@ int main(void)
 					board_io_track_led_set(b, on);
 				}
 			} else {
-			board_io_track_led_set(0, button_engine_is_latched(&g_eng, 0));
-			board_io_track_led_set(1, button_engine_step_index(&g_eng, 1) != 0);
-			for (int b = 2; b < PROFILE_NUM_BUTTONS; b++) {
-				const preset_slot_t *ps =
-					button_engine_get_preset(&g_eng,
-								 prof->button[b].preset_slot);
+			for (int b = 0, h = 0; b < PROFILE_NUM_BUTTONS; b++) {
+				const button_cfg_t *c = &prof->button[b];
+				bool on = false;
 
-				board_io_track_led_set(b, ps != NULL && ps->len > 0);
+				if (c->mode == BTN_MODE_TOGGLE) {
+					on = button_engine_is_latched(&g_eng, b);
+				} else if (c->mode == BTN_MODE_CYCLE) {
+					on = button_engine_step_index(&g_eng, b) != 0;
+				} else if (c->mode == BTN_MODE_HOLD) {
+					on = perform_is_held(&g_perf, h++);
+				} else if (c->mode == BTN_MODE_PRESET) {
+					const preset_slot_t *ps =
+						button_engine_get_preset(&g_eng, c->preset_slot);
+					on = ps != NULL && ps->len > 0;
+				}
+				board_io_track_led_set(b, on);
 			}
 			}
 		}
@@ -312,6 +371,7 @@ int main(void)
 		static int diag_div;
 		if (!g_diag_quiet && ++diag_div >= 40) {                 /* every 200 ms */
 			diag_div = 0;
+			printk("vol=%4d song=%u  ", g_last_vol_raw, g_perf.song + 1u);
 			printk("f0=%4d f1=%4d f2=%4d f3=%4d  lad=%4d btn=%d  "
 			       "batt=%4d usb=%d chg=%d  "
 			       "push=%u drain=%u usbtx=%u rdy=%d\n",
@@ -348,17 +408,42 @@ int main(void)
 			uint32_t now = (uint32_t)k_uptime_get();
 			cc_msg_t msgs[PROFILE_MAX_CAPTURE];
 
-			/* PLAY dumps the storage page (Task 7.0). Read only, and
-			 * on a button rather than at boot: a CDC console discards
-			 * anything printed before the host opens the port. */
+			/* PLAY = next chord (the loop engine). Function + PLAY
+			 * still dumps the storage page (Task 7.0) for diagnosis. */
 			static bool play_was_down;
 			bool play_down = (pressed == 4);
 
 			if (play_down && !play_was_down) {
-				(void)midi_tx_idle(200);
-				preset_store_dump();
+				if (board_io_function_held()) {
+					(void)midi_tx_idle(200);
+					preset_store_dump();
+				} else if (perform_play(&g_perf, now, msgs) == 1) {
+					midi_tx_send(msgs[0]);
+				}
 			}
 			play_was_down = play_down;
+
+			/* Rocker = song -/+ (Program Change), on the press. */
+			static int vol_was = -1;
+			int vol = debounced_vol_button();
+
+			if (vol != vol_was && (vol == 0 || vol == 2)) {
+				if (perform_rocker(&g_perf, vol == 2 ? +1 : -1, msgs) == 1) {
+					midi_tx_send(msgs[0]);
+				}
+			}
+			vol_was = vol;
+
+			/* Held stutters: 127 on the press, repeated every 100 ms,
+			 * 0 on the release. */
+			for (int b = 0, h = 0; b < PROFILE_NUM_BUTTONS; b++) {
+				if (prof->button[b].mode != BTN_MODE_HOLD) {
+					continue;
+				}
+				if (perform_hold(&g_perf, h++, pressed == b, now, msgs) == 1) {
+					midi_tx_send(msgs[0]);
+				}
+			}
 
 			for (int i = 0; i < PROFILE_NUM_BUTTONS; i++) {
 				uint8_t ev = btn_update(&g_btn[i], pressed == i, now);

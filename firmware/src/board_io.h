@@ -36,6 +36,13 @@ int  board_io_decode_track_button(int raw);
 
 bool board_io_function_held(void);
 
+/* Ladder 2: Vol -/+ and the side rocker (transplanted from Syrup, which
+ * took it from the looper's decode_vol). Raw 12-bit code, negative on a
+ * failed read. */
+int  board_io_read_vol_ladder(void);
+/* -1 none, 0 rocker down, 1 vol-down, 2 rocker up, 3 vol-up. */
+int  board_io_decode_vol(int raw);
+
 /* Charger telemetry, straight off the BQ24232's open-drain status pins.
  * Both are active LOW at the pin; these return the logical sense. */
 bool board_io_usb_present(void);   /* nPGOOD low: bus power is there   */

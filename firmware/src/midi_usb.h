@@ -17,6 +17,7 @@
 
 void midi_usb_init(void);
 void midi_usb_send_cc(uint8_t channel, uint8_t cc, uint8_t value);
+void midi_usb_send_pc(uint8_t channel, uint8_t program);
 bool midi_usb_ready(void);
 
 #endif /* SP1_MIDI_USB_H */

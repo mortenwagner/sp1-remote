@@ -27,6 +27,10 @@ typedef enum {
     /* Emit a fixed list of (cc, value) pairs configured in the table. This
      * is what makes the surface generic: any button can be any list. */
     BTN_MODE_LIST    = 3,
+    /* Held stutter: handled by the performance layer (perform.c), which
+     * sends 127 on the press, repeats it while held and sends 0 on the
+     * release. The button engine sends nothing for it. */
+    BTN_MODE_HOLD    = 4,
 } btn_mode_t;
 
 typedef struct {
@@ -55,6 +59,10 @@ typedef struct {
     uint8_t      preset_capture_len;
 } profile_t;
 
+/* The shipped mapping: the PopGoblin loop engine (2026-11-06). */
 extern const profile_t profile_popgoblin_default;
+/* The July chain-v2 mapping (freeze, shimmer cycle, two preset scenes).
+ * Kept for the button-engine tests, which exercise every mode on it. */
+extern const profile_t profile_popgoblin_v2;
 
 #endif /* SP1_PROFILE_H */

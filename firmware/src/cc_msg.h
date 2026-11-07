@@ -14,4 +14,10 @@ typedef struct {
     uint8_t value;
 } cc_msg_t;
 
+/* A cc number no Control Change can have (CCs are 0..127). A message with
+ * this cc is a Program Change whose program is `value`; the transmit layer
+ * turns it into the right bytes. Kept in cc_msg_t so Program Change rides
+ * the same coalescing queue as everything else. */
+#define CC_MSG_PROGRAM 0x80u
+
 #endif /* SP1_CC_MSG_H */
